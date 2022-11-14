@@ -1,0 +1,948 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="566" onload="init(evt)" viewBox="0 0 1200 566" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="566.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Memory</text>
+<text id="details" x="10.00" y="549" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="549" > </text>
+<g id="frames">
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (2,025,245,245 samples, 2.33%)</title><rect x="52.8" y="261" width="27.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="55.78" y="271.5" >M..</text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (46,513,524 samples, 0.05%)</title><rect x="1188.3" y="85" width="0.6" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1191.26" y="95.5" ></text>
+</g>
+<g >
+<title>void* std::__1::__thread_proxy&lt;std::__1::tuple&lt;std::__1::unique_ptr&lt;std::__1::__thread_struct, std::__1::default_delete&lt;std::__1::__thread_struct&gt; &gt;, void ThreadPoolImpl&lt;std::__1::thread&gt;::scheduleImpl&lt;void&gt;(std::__1::function&lt;void ()&gt;, int, std::__1::optional&lt;unsigned long&gt;)::\'lambda0\'()&gt; &gt;(void*) (87,051,858,816 samples, 100.00%)</title><rect x="10.0" y="469" width="1180.0" height="15.0" fill="rgb(240,131,39)" rx="2" ry="2" />
+<text  x="13.00" y="479.5" >void* std::__1::__thread_proxy&lt;std::__1::tuple&lt;std::__1::unique_ptr&lt;std::__1::__thread_struct, std::__1::default_delete&lt;std::__1::__thread_struct&gt; &gt;, void ThreadPoo..</text>
+</g>
+<g >
+<title>DB::ExecutionThreadContext::executeTask() (87,051,858,816 samples, 100.00%)</title><rect x="10.0" y="405" width="1180.0" height="15.0" fill="rgb(237,133,36)" rx="2" ry="2" />
+<text  x="13.00" y="415.5" >DB::ExecutionThreadContext::executeTask()</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (17,143,989 samples, 0.02%)</title><rect x="1189.1" y="149" width="0.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1192.08" y="159.5" ></text>
+</g>
+<g >
+<title>DB::ISource::work() (9,850,942,374 samples, 11.32%)</title><rect x="1053.7" y="389" width="133.6" height="15.0" fill="rgb(237,133,36)" rx="2" ry="2" />
+<text  x="1056.74" y="399.5" >DB::ISource::wor..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (3,791,125,852 samples, 4.36%)</title><rect x="1069.0" y="197" width="51.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1071.98" y="207.5" >Memor..</text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (47,619,279 samples, 0.05%)</title><rect x="1187.3" y="165" width="0.6" height="15.0" fill="rgb(247,154,46)" rx="2" ry="2" />
+<text  x="1190.27" y="175.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (2,335,878,632 samples, 2.68%)</title><rect x="1022.0" y="309" width="31.7" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1025.02" y="319.5" >Me..</text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (454,439,520 samples, 0.52%)</title><rect x="1146.1" y="213" width="6.2" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1149.14" y="223.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::executeImplBatch&lt;false, false, DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;::State&amp;, DB::Arena*, unsigned long, DB::Aggregator::AggregateFunctionInstruction*, char*) const (71,792,537,534 samples, 82.47%)</title><rect x="80.5" y="325" width="973.2" height="15.0" fill="rgb(237,131,35)" rx="2" ry="2" />
+<text  x="83.53" y="335.5" >void DB::Aggregator::executeImplBatch&lt;false, false, DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSave..</text>
+</g>
+<g >
+<title>DB::ColumnString::index(DB::IColumn const&amp;, unsigned long) const (5,172,615,595 samples, 5.94%)</title><rect x="10.1" y="325" width="70.1" height="15.0" fill="rgb(237,133,35)" rx="2" ry="2" />
+<text  x="13.11" y="335.5" >DB::Col..</text>
+</g>
+<g >
+<title>DB::SerializationLowCardinality::deserializeBinaryBulkWithMultipleStreams(COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;&amp;, unsigned long, DB::ISerialization::DeserializeBinaryBulkSettings&amp;, std::__1::shared_ptr&lt;DB::ISerialization::DeserializeBinaryBulkState&gt;&amp;, std::__1::unordered_map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::hash&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::equal_to&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt; &gt;*) const (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="213" width="2.7" height="15.0" fill="rgb(237,133,35)" rx="2" ry="2" />
+<text  x="1190.27" y="223.5" ></text>
+</g>
+<g >
+<title>DB::Aggregator::executeOnBlock(std::__1::vector&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt;, unsigned long, DB::AggregatedDataVariants&amp;, std::__1::vector&lt;DB::IColumn const*, std::__1::allocator&lt;DB::IColumn const*&gt; &gt;&amp;, std::__1::vector&lt;std::__1::vector&lt;DB::IColumn const*, std::__1::allocator&lt;DB::IColumn const*&gt; &gt;, std::__1::allocator&lt;std::__1::vector&lt;DB::IColumn const*, std::__1::allocator&lt;DB::IColumn const*&gt; &gt; &gt; &gt;&amp;, bool&amp;) const (76,999,717,081 samples, 88.45%)</title><rect x="10.0" y="357" width="1043.7" height="15.0" fill="rgb(237,133,35)" rx="2" ry="2" />
+<text  x="13.00" y="367.5" >DB::Aggregator::executeOnBlock(std::__1::vector&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::immutable_ptr..</text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::ColumnString::indexImpl&lt;unsigned short&gt;(DB::PODArray&lt;unsigned short, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt; const&amp;, unsigned long) const (16,866,048 samples, 0.02%)</title><rect x="1188.0" y="117" width="0.3" height="15.0" fill="rgb(237,154,35)" rx="2" ry="2" />
+<text  x="1191.03" y="127.5" ></text>
+</g>
+<g >
+<title>DB::PipelineExecutor::executeStepImpl(unsigned long, std::__1::atomic&lt;bool&gt;*) (87,051,858,816 samples, 100.00%)</title><rect x="10.0" y="421" width="1180.0" height="15.0" fill="rgb(241,133,40)" rx="2" ry="2" />
+<text  x="13.00" y="431.5" >DB::PipelineExecutor::executeStepImpl(unsigned long, std::__1::atomic&lt;bool&gt;*)</text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;1ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (17,143,989 samples, 0.02%)</title><rect x="1189.1" y="181" width="0.2" height="15.0" fill="rgb(247,131,46)" rx="2" ry="2" />
+<text  x="1192.08" y="191.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (671,089,280 samples, 0.77%)</title><rect x="1059.9" y="277" width="9.1" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1062.88" y="287.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (29,640,670 samples, 0.03%)</title><rect x="1188.5" y="69" width="0.4" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1191.49" y="79.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (9,460,816 samples, 0.01%)</title><rect x="1187.3" y="101" width="0.1" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1190.27" y="111.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeRangeReader::startReadingChain(unsigned long, std::__1::deque&lt;DB::MarkRange, std::__1::allocator&lt;DB::MarkRange&gt; &gt;&amp;) (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="277" width="2.7" height="15.0" fill="rgb(246,133,45)" rx="2" ry="2" />
+<text  x="1190.27" y="287.5" ></text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (13,638,065 samples, 0.02%)</title><rect x="1188.9" y="181" width="0.2" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="1191.89" y="191.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (1,901,392,472 samples, 2.18%)</title><rect x="1120.4" y="181" width="25.7" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1123.37" y="191.5" >M..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (38,158,463 samples, 0.04%)</title><rect x="1187.4" y="101" width="0.5" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1190.40" y="111.5" ></text>
+</g>
+<g >
+<title> (87,051,858,816 samples, 100.00%)</title><rect x="10.0" y="485" width="1180.0" height="15.0" fill="rgb(255,230,55)" rx="2" ry="2" />
+<text  x="13.00" y="495.5" ></text>
+</g>
+<g >
+<title>DB::AggregatingTransform::consume(DB::Chunk) (76,999,717,081 samples, 88.45%)</title><rect x="10.0" y="373" width="1043.7" height="15.0" fill="rgb(243,133,41)" rx="2" ry="2" />
+<text  x="13.00" y="383.5" >DB::AggregatingTransform::consume(DB::Chunk)</text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Dictionary::compact(COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;&amp;) (63,379,572 samples, 0.07%)</title><rect x="1188.0" y="165" width="0.9" height="15.0" fill="rgb(246,133,45)" rx="2" ry="2" />
+<text  x="1191.03" y="175.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (29,717,199 samples, 0.03%)</title><rect x="10.1" y="245" width="0.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="13.11" y="255.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (16,872,854 samples, 0.02%)</title><rect x="1188.3" y="37" width="0.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1191.26" y="47.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::insertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (56,035,081 samples, 0.06%)</title><rect x="1187.3" y="197" width="0.7" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="1190.27" y="207.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::mergeDataImpl&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;, false, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;(HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, DB::Arena*) const (2,579,908,002 samples, 2.96%)</title><rect x="1152.3" y="325" width="35.0" height="15.0" fill="rgb(237,131,35)" rx="2" ry="2" />
+<text  x="1155.30" y="335.5" >vo..</text>
+</g>
+<g >
+<title>void DB::Aggregator::executeImpl&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, DB::Arena*, unsigned long, std::__1::vector&lt;DB::IColumn const*, std::__1::allocator&lt;DB::IColumn const*&gt; &gt;&amp;, DB::Aggregator::AggregateFunctionInstruction*, bool, char*) const (71,792,537,534 samples, 82.47%)</title><rect x="80.5" y="341" width="973.2" height="15.0" fill="rgb(237,131,35)" rx="2" ry="2" />
+<text  x="83.53" y="351.5" >void DB::Aggregator::executeImpl&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, ch..</text>
+</g>
+<g >
+<title>DB::ConvertingAggregatedToChunksSource::generate() (9,850,942,374 samples, 11.32%)</title><rect x="1053.7" y="357" width="133.6" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1056.74" y="367.5" >DB::ConvertingAg..</text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::deserializeAndInsertFromArena(char const*) (6,146,957,844 samples, 7.06%)</title><rect x="1069.0" y="261" width="83.3" height="15.0" fill="rgb(237,133,36)" rx="2" ry="2" />
+<text  x="1071.98" y="271.5" >DB::Colum..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (436,208,240 samples, 0.50%)</title><rect x="1054.0" y="277" width="5.9" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1056.97" y="287.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (5,692,518,324 samples, 6.54%)</title><rect x="1069.0" y="229" width="77.1" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1071.98" y="239.5" >DB::Reve..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (9,262,881 samples, 0.01%)</title><rect x="1189.0" y="101" width="0.1" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1191.95" y="111.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (16,779,008 samples, 0.02%)</title><rect x="1053.7" y="277" width="0.3" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1056.74" y="287.5" ></text>
+</g>
+<g >
+<title>HashTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;::resize(unsigned long, unsigned long) (8,413,184 samples, 0.01%)</title><rect x="10.0" y="309" width="0.1" height="15.0" fill="rgb(247,146,46)" rx="2" ry="2" />
+<text  x="13.00" y="319.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (13,638,065 samples, 0.02%)</title><rect x="1188.9" y="149" width="0.2" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1191.89" y="159.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (1,901,392,472 samples, 2.18%)</title><rect x="1120.4" y="197" width="25.7" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1123.37" y="207.5" >M..</text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertData(char const*, unsigned long) (5,692,518,324 samples, 6.54%)</title><rect x="1069.0" y="245" width="77.1" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="1071.98" y="255.5" >DB::Colu..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (46,778,258 samples, 0.05%)</title><rect x="1189.4" y="149" width="0.6" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1192.37" y="159.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;unsigned long&gt;::reserve(unsigned long) (436,208,240 samples, 0.50%)</title><rect x="1054.0" y="309" width="5.9" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="1056.97" y="319.5" ></text>
+</g>
+<g >
+<title>all (87,051,858,816 samples, 100%)</title><rect x="10.0" y="517" width="1180.0" height="15.0" fill="rgb(255,230,55)" rx="2" ry="2" />
+<text  x="13.00" y="527.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (8,413,184 samples, 0.01%)</title><rect x="10.0" y="277" width="0.1" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="13.00" y="287.5" ></text>
+</g>
+<g >
+<title>DB::ColumnString::index(DB::IColumn const&amp;, unsigned long) const (16,866,048 samples, 0.02%)</title><rect x="1188.0" y="149" width="0.3" height="15.0" fill="rgb(237,133,35)" rx="2" ry="2" />
+<text  x="1191.03" y="159.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (46,778,258 samples, 0.05%)</title><rect x="1189.4" y="133" width="0.6" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1192.37" y="143.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeReaderWide::readRows(unsigned long, unsigned long, bool, unsigned long, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;) (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="245" width="2.7" height="15.0" fill="rgb(246,133,45)" rx="2" ry="2" />
+<text  x="1190.27" y="255.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeReaderWide::readData(DB::NameAndTypePair const&amp;, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;&amp;, unsigned long, bool, unsigned long, unsigned long, std::__1::unordered_map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::hash&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::equal_to&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt; &gt;&amp;, bool) (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="229" width="2.7" height="15.0" fill="rgb(241,133,39)" rx="2" ry="2" />
+<text  x="1190.27" y="239.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (9,262,881 samples, 0.01%)</title><rect x="1189.0" y="117" width="0.1" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1191.95" y="127.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (46,778,258 samples, 0.05%)</title><rect x="1189.4" y="165" width="0.6" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1192.37" y="175.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;8ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (2,025,245,245 samples, 2.33%)</title><rect x="52.8" y="277" width="27.4" height="15.0" fill="rgb(247,131,46)" rx="2" ry="2" />
+<text  x="55.78" y="287.5" >v..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (436,208,240 samples, 0.50%)</title><rect x="1054.0" y="293" width="5.9" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1056.97" y="303.5" ></text>
+</g>
+<g >
+<title>void HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;::forEachValue&lt;void DB::Aggregator::convertToBlockImplFinal&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;, false, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, std::__1::vector&lt;DB::IColumn*, std::__1::allocator&lt;DB::IColumn*&gt; &gt;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, DB::Arena*) const::\'lambda\'(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt; const&amp;, auto&amp;)&gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;&amp;) (6,146,957,844 samples, 7.06%)</title><rect x="1069.0" y="277" width="83.3" height="15.0" fill="rgb(246,131,45)" rx="2" ry="2" />
+<text  x="1071.98" y="287.5" >void Hash..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (21,964,336,398 samples, 25.23%)</title><rect x="80.5" y="277" width="297.8" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="83.53" y="287.5" >MemoryTracker::allocImpl(long, bool)</text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (2,579,908,002 samples, 2.96%)</title><rect x="1152.3" y="293" width="35.0" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1155.30" y="303.5" >Al..</text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;char8_t&gt;::reserve(unsigned long) (16,779,008 samples, 0.02%)</title><rect x="1053.7" y="309" width="0.3" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="1056.74" y="319.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (5,634,998,739 samples, 6.47%)</title><rect x="378.3" y="277" width="76.3" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="381.26" y="287.5" >MemoryTr..</text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (9,262,881 samples, 0.01%)</title><rect x="1189.0" y="133" width="0.1" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1191.95" y="143.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (29,717,199 samples, 0.03%)</title><rect x="10.1" y="261" width="0.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="13.11" y="271.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::compactInplace() (63,379,572 samples, 0.07%)</title><rect x="1188.0" y="181" width="0.9" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1191.03" y="191.5" ></text>
+</g>
+<g >
+<title>DB::ColumnString::insertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (17,143,989 samples, 0.02%)</title><rect x="1189.1" y="197" width="0.2" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="1192.08" y="207.5" ></text>
+</g>
+<g >
+<title>DB::ISource::work() (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="373" width="2.7" height="15.0" fill="rgb(237,133,36)" rx="2" ry="2" />
+<text  x="1190.27" y="383.5" ></text>
+</g>
+<g >
+<title>DB::Arena::addMemoryChunk(unsigned long) (5,634,998,739 samples, 6.47%)</title><rect x="378.3" y="309" width="76.3" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="381.26" y="319.5" >DB::Aren..</text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (9,460,816 samples, 0.01%)</title><rect x="1187.3" y="133" width="0.1" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1190.27" y="143.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (5,634,998,739 samples, 6.47%)</title><rect x="378.3" y="293" width="76.3" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="381.26" y="303.5" >MemoryTr..</text>
+</g>
+<g >
+<title>void DB::Aggregator::executeImplBatch&lt;false, false, DB::AggregationMethodSerialized&lt;HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, HashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, HashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;&amp;, DB::AggregationMethodSerialized&lt;HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, HashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;::State&amp;, DB::Arena*, unsigned long, DB::Aggregator::AggregateFunctionInstruction*, char*) const (21,956,448 samples, 0.03%)</title><rect x="80.2" y="325" width="0.3" height="15.0" fill="rgb(237,131,35)" rx="2" ry="2" />
+<text  x="83.23" y="335.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (47,619,279 samples, 0.05%)</title><rect x="1187.3" y="149" width="0.6" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1190.27" y="159.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeBaseSelectProcessor::readFromPartImpl() (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="309" width="2.7" height="15.0" fill="rgb(245,133,44)" rx="2" ry="2" />
+<text  x="1190.27" y="319.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::insertRangeFromDictionaryEncodedColumn(DB::IColumn const&amp;, DB::IColumn const&amp;) (77,017,637 samples, 0.09%)</title><rect x="1188.0" y="197" width="1.1" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1191.03" y="207.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::convertToBlockImplFinal&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;, false, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, std::__1::vector&lt;DB::IColumn*, std::__1::allocator&lt;DB::IColumn*&gt; &gt;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, DB::Arena*) const (6,818,047,124 samples, 7.83%)</title><rect x="1059.9" y="293" width="92.4" height="15.0" fill="rgb(237,131,35)" rx="2" ry="2" />
+<text  x="1062.88" y="303.5" >void DB::Ag..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (29,640,670 samples, 0.03%)</title><rect x="1188.5" y="37" width="0.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1191.49" y="47.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (454,439,520 samples, 0.52%)</title><rect x="1146.1" y="181" width="6.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1149.14" y="191.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (29,640,670 samples, 0.03%)</title><rect x="1188.5" y="53" width="0.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1191.49" y="63.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (1,901,392,472 samples, 2.18%)</title><rect x="1120.4" y="213" width="25.7" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1123.37" y="223.5" >A..</text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::ColumnString::indexImpl&lt;char8_t&gt;(DB::PODArray&lt;char8_t, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt; const&amp;, unsigned long) const (34,070,591 samples, 0.04%)</title><rect x="10.1" y="293" width="0.5" height="15.0" fill="rgb(237,154,35)" rx="2" ry="2" />
+<text  x="13.11" y="303.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;1ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (12,643,624 samples, 0.01%)</title><rect x="1188.0" y="101" width="0.2" height="15.0" fill="rgb(247,131,46)" rx="2" ry="2" />
+<text  x="1191.03" y="111.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;1ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (46,778,258 samples, 0.05%)</title><rect x="1189.4" y="181" width="0.6" height="15.0" fill="rgb(247,131,46)" rx="2" ry="2" />
+<text  x="1192.37" y="191.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;1ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (29,717,199 samples, 0.03%)</title><rect x="10.1" y="277" width="0.4" height="15.0" fill="rgb(247,131,46)" rx="2" ry="2" />
+<text  x="13.11" y="287.5" ></text>
+</g>
+<g >
+<title>DB::recursiveRemoveLowCardinality(COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; const&amp;) (5,172,615,595 samples, 5.94%)</title><rect x="10.1" y="341" width="70.1" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="13.11" y="351.5" >DB::rec..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (671,089,280 samples, 0.77%)</title><rect x="1059.9" y="261" width="9.1" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1062.88" y="271.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;1ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (3,113,299,759 samples, 3.58%)</title><rect x="10.6" y="277" width="42.2" height="15.0" fill="rgb(247,131,46)" rx="2" ry="2" />
+<text  x="13.58" y="287.5" >voi..</text>
+</g>
+<g >
+<title>DB::AggregatedDataVariants::convertToTwoLevel() (8,413,184 samples, 0.01%)</title><rect x="10.0" y="341" width="0.1" height="15.0" fill="rgb(245,133,44)" rx="2" ry="2" />
+<text  x="13.00" y="351.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (17,143,989 samples, 0.02%)</title><rect x="1189.1" y="165" width="0.2" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1192.08" y="175.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (21,956,448 samples, 0.03%)</title><rect x="80.2" y="277" width="0.3" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="83.23" y="287.5" ></text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (47,619,279 samples, 0.05%)</title><rect x="1187.3" y="181" width="0.6" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="1190.27" y="191.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeRangeReader::DelayedStream::finalize(std::__1::vector&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;) (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="261" width="2.7" height="15.0" fill="rgb(246,133,45)" rx="2" ry="2" />
+<text  x="1190.27" y="271.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::selectIndexImpl&lt;DB::ColumnString&gt;(DB::ColumnString const&amp;, DB::IColumn const&amp;, unsigned long) (5,172,615,595 samples, 5.94%)</title><rect x="10.1" y="309" width="70.1" height="15.0" fill="rgb(247,154,46)" rx="2" ry="2" />
+<text  x="13.11" y="319.5" >COW&lt;DB:..</text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (38,158,463 samples, 0.04%)</title><rect x="1187.4" y="133" width="0.5" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1190.40" y="143.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (17,143,989 samples, 0.02%)</title><rect x="1189.1" y="133" width="0.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1192.08" y="143.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (2,579,908,002 samples, 2.96%)</title><rect x="1152.3" y="277" width="35.0" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1155.30" y="287.5" >Me..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (41,857,323,765 samples, 48.08%)</title><rect x="454.6" y="277" width="567.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="457.64" y="287.5" >MemoryTracker::allocImpl(long, bool)</text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (16,872,854 samples, 0.02%)</title><rect x="1188.3" y="69" width="0.2" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1191.26" y="79.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (3,113,299,759 samples, 3.58%)</title><rect x="10.6" y="245" width="42.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="13.58" y="255.5" >Mem..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (38,158,463 samples, 0.04%)</title><rect x="1187.4" y="117" width="0.5" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1190.40" y="127.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (3,113,299,759 samples, 3.58%)</title><rect x="10.6" y="261" width="42.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="13.58" y="271.5" >Mem..</text>
+</g>
+<g >
+<title>__clone (87,051,858,816 samples, 100.00%)</title><rect x="10.0" y="501" width="1180.0" height="15.0" fill="rgb(251,144,50)" rx="2" ry="2" />
+<text  x="13.00" y="511.5" >__clone</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (41,857,323,765 samples, 48.08%)</title><rect x="454.6" y="261" width="567.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="457.64" y="271.5" >MemoryTracker::allocImpl(long, bool)</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (2,025,245,245 samples, 2.33%)</title><rect x="52.8" y="245" width="27.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="55.78" y="255.5" >M..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (12,643,624 samples, 0.01%)</title><rect x="1188.0" y="69" width="0.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1191.03" y="79.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeBaseSelectProcessor::readFromPart() (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="325" width="2.7" height="15.0" fill="rgb(239,133,38)" rx="2" ry="2" />
+<text  x="1190.27" y="335.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;unsigned int&gt;::insert(DB::Field const&amp;) (454,439,520 samples, 0.52%)</title><rect x="1146.1" y="245" width="6.2" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1149.14" y="255.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (16,872,854 samples, 0.02%)</title><rect x="1188.3" y="53" width="0.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1191.26" y="63.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeRangeReader::read(unsigned long, std::__1::deque&lt;DB::MarkRange, std::__1::allocator&lt;DB::MarkRange&gt; &gt;&amp;) (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="293" width="2.7" height="15.0" fill="rgb(246,133,45)" rx="2" ry="2" />
+<text  x="1190.27" y="303.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (9,460,816 samples, 0.01%)</title><rect x="1187.3" y="117" width="0.1" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1190.27" y="127.5" ></text>
+</g>
+<g >
+<title>DB::AggregatingTransform::work() (76,999,717,081 samples, 88.45%)</title><rect x="10.0" y="389" width="1043.7" height="15.0" fill="rgb(237,133,36)" rx="2" ry="2" />
+<text  x="13.00" y="399.5" >DB::AggregatingTransform::work()</text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (3,791,125,852 samples, 4.36%)</title><rect x="1069.0" y="213" width="51.4" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="1071.98" y="223.5" >Alloc..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (2,335,878,632 samples, 2.68%)</title><rect x="1022.0" y="293" width="31.7" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1025.02" y="303.5" >Me..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (2,579,908,002 samples, 2.96%)</title><rect x="1152.3" y="261" width="35.0" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1155.30" y="271.5" >Me..</text>
+</g>
+<g >
+<title>DB::MergeTreeBaseSelectProcessor::generate() (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="341" width="2.7" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1190.27" y="351.5" ></text>
+</g>
+<g >
+<title>DB::ISource::tryGenerate() (9,850,942,374 samples, 11.32%)</title><rect x="1053.7" y="373" width="133.6" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1056.74" y="383.5" >DB::ISource::try..</text>
+</g>
+<g >
+<title>DB::SourceWithProgress::work() (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="389" width="2.7" height="15.0" fill="rgb(237,133,36)" rx="2" ry="2" />
+<text  x="1190.27" y="399.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (46,513,524 samples, 0.05%)</title><rect x="1188.3" y="101" width="0.6" height="15.0" fill="rgb(247,154,46)" rx="2" ry="2" />
+<text  x="1191.26" y="111.5" ></text>
+</g>
+<g >
+<title>DB::Block DB::Aggregator::prepareBlockAndFill&lt;DB::Block DB::Aggregator::convertOneBucketToBlock&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt; &gt;(DB::AggregatedDataVariants&amp;, DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, DB::Arena*, bool, unsigned long) const::\'lambda\'(std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, std::__1::vector&lt;DB::PODArray&lt;char*, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;*, std::__1::allocator&lt;DB::PODArray&lt;char*, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;*&gt; &gt;&amp;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, bool)&gt;(DB::AggregatedDataVariants&amp;, bool, unsigned long, DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;&amp;) const (7,271,034,372 samples, 8.35%)</title><rect x="1053.7" y="325" width="98.6" height="15.0" fill="rgb(237,133,35)" rx="2" ry="2" />
+<text  x="1056.74" y="335.5" >DB::Block D..</text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (21,964,336,398 samples, 25.23%)</title><rect x="80.5" y="309" width="297.8" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="83.53" y="319.5" >Allocator&lt;true, true&gt;::realloc(void*, un..</text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;char8_t&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;char8_t&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (46,513,524 samples, 0.05%)</title><rect x="1188.3" y="133" width="0.6" height="15.0" fill="rgb(247,154,46)" rx="2" ry="2" />
+<text  x="1191.26" y="143.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::selectIndexImpl&lt;DB::ColumnString&gt;(DB::ColumnString const&amp;, DB::IColumn const&amp;, unsigned long) (16,866,048 samples, 0.02%)</title><rect x="1188.0" y="133" width="0.3" height="15.0" fill="rgb(247,154,46)" rx="2" ry="2" />
+<text  x="1191.03" y="143.5" ></text>
+</g>
+<g >
+<title>DB::ISource::tryGenerate() (201,199,361 samples, 0.23%)</title><rect x="1187.3" y="357" width="2.7" height="15.0" fill="rgb(242,133,40)" rx="2" ry="2" />
+<text  x="1190.27" y="367.5" ></text>
+</g>
+<g >
+<title>DB::Aggregator::mergeAndConvertOneBucketToBlock(std::__1::vector&lt;std::__1::shared_ptr&lt;DB::AggregatedDataVariants&gt;, std::__1::allocator&lt;std::__1::shared_ptr&lt;DB::AggregatedDataVariants&gt; &gt; &gt;&amp;, DB::Arena*, bool, unsigned long, std::__1::atomic&lt;bool&gt;*) const (9,850,942,374 samples, 11.32%)</title><rect x="1053.7" y="341" width="133.6" height="15.0" fill="rgb(237,133,35)" rx="2" ry="2" />
+<text  x="1056.74" y="351.5" >DB::Aggregator::..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (3,791,125,852 samples, 4.36%)</title><rect x="1069.0" y="181" width="51.4" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1071.98" y="191.5" >Memor..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (16,779,008 samples, 0.02%)</title><rect x="1053.7" y="293" width="0.3" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1056.74" y="303.5" ></text>
+</g>
+<g >
+<title>DB::ColumnString::serializeValueIntoArena(unsigned long, DB::Arena&amp;, char const*&amp;) const (41,857,323,765 samples, 48.08%)</title><rect x="454.6" y="309" width="567.4" height="15.0" fill="rgb(237,133,35)" rx="2" ry="2" />
+<text  x="457.64" y="319.5" >DB::ColumnString::serializeValueIntoArena(unsigned long, DB::Arena&amp;, char cons..</text>
+</g>
+<g >
+<title>void std::__1::__function::__policy_invoker&lt;void ()&gt;::__call_impl&lt;std::__1::__function::__default_alloc_func&lt;ThreadFromGlobalPool::ThreadFromGlobalPool&lt;DB::PipelineExecutor::executeImpl(unsigned long)::$_1&gt;(DB::PipelineExecutor::executeImpl(unsigned long)::$_1&amp;&amp;)::\'lambda\'(), void ()&gt; &gt;(std::__1::__function::__policy_storage const*) (87,051,858,816 samples, 100.00%)</title><rect x="10.0" y="437" width="1180.0" height="15.0" fill="rgb(237,131,36)" rx="2" ry="2" />
+<text  x="13.00" y="447.5" >void std::__1::__function::__policy_invoker&lt;void ()&gt;::__call_impl&lt;std::__1::__function::__default_alloc_func&lt;ThreadFromGlobalPool::ThreadFromGlobalPool&lt;DB::Pipeline..</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (21,964,336,398 samples, 25.23%)</title><rect x="80.5" y="293" width="297.8" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="83.53" y="303.5" >MemoryTracker::allocImpl(long, bool)</text>
+</g>
+<g >
+<title>DB::Arena::addMemoryChunk(unsigned long) (41,857,323,765 samples, 48.08%)</title><rect x="454.6" y="293" width="567.4" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="457.64" y="303.5" >DB::Arena::addMemoryChunk(unsigned long)</text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (46,513,524 samples, 0.05%)</title><rect x="1188.3" y="149" width="0.6" height="15.0" fill="rgb(247,133,46)" rx="2" ry="2" />
+<text  x="1191.26" y="159.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (8,413,184 samples, 0.01%)</title><rect x="10.0" y="293" width="0.1" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="13.00" y="303.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::ColumnString::indexImpl&lt;unsigned short&gt;(DB::PODArray&lt;unsigned short, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt; const&amp;, unsigned long) const (5,138,545,004 samples, 5.90%)</title><rect x="10.6" y="293" width="69.6" height="15.0" fill="rgb(237,154,35)" rx="2" ry="2" />
+<text  x="13.58" y="303.5" >COW&lt;DB:..</text>
+</g>
+<g >
+<title>TwoLevelHashTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;, 8ul&gt;::TwoLevelHashTable&lt;HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, HashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;(HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, HashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; const&amp;) (8,413,184 samples, 0.01%)</title><rect x="10.0" y="325" width="0.1" height="15.0" fill="rgb(242,142,40)" rx="2" ry="2" />
+<text  x="13.00" y="335.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;char8_t&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;char8_t&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long)::\'lambda\'(unsigned long&amp;)::operator()(unsigned long&amp;) const (46,513,524 samples, 0.05%)</title><rect x="1188.3" y="117" width="0.6" height="15.0" fill="rgb(237,154,35)" rx="2" ry="2" />
+<text  x="1191.26" y="127.5" ></text>
+</g>
+<g >
+<title>HashTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;::resize(unsigned long, unsigned long) (2,579,908,002 samples, 2.96%)</title><rect x="1152.3" y="309" width="35.0" height="15.0" fill="rgb(247,146,46)" rx="2" ry="2" />
+<text  x="1155.30" y="319.5" >Ha..</text>
+</g>
+<g >
+<title>ThreadPoolImpl&lt;std::__1::thread&gt;::worker(std::__1::__list_iterator&lt;std::__1::thread, void*&gt;) (87,051,858,816 samples, 100.00%)</title><rect x="10.0" y="453" width="1180.0" height="15.0" fill="rgb(241,153,40)" rx="2" ry="2" />
+<text  x="13.00" y="463.5" >ThreadPoolImpl&lt;std::__1::thread&gt;::worker(std::__1::__list_iterator&lt;std::__1::thread, void*&gt;)</text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (8,413,184 samples, 0.01%)</title><rect x="10.0" y="261" width="0.1" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="13.00" y="271.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (21,956,448 samples, 0.03%)</title><rect x="80.2" y="293" width="0.3" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="83.23" y="303.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (454,439,520 samples, 0.52%)</title><rect x="1146.1" y="197" width="6.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1149.14" y="207.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::executeImpl&lt;DB::AggregationMethodSerialized&lt;HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, HashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, HashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;&amp;, DB::Arena*, unsigned long, std::__1::vector&lt;DB::IColumn const*, std::__1::allocator&lt;DB::IColumn const*&gt; &gt;&amp;, DB::Aggregator::AggregateFunctionInstruction*, bool, char*) const (21,956,448 samples, 0.03%)</title><rect x="80.2" y="341" width="0.3" height="15.0" fill="rgb(237,131,35)" rx="2" ry="2" />
+<text  x="83.23" y="351.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (12,643,624 samples, 0.01%)</title><rect x="1188.0" y="85" width="0.2" height="15.0" fill="rgb(241,160,39)" rx="2" ry="2" />
+<text  x="1191.03" y="95.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (21,956,448 samples, 0.03%)</title><rect x="80.2" y="309" width="0.3" height="15.0" fill="rgb(247,144,46)" rx="2" ry="2" />
+<text  x="83.23" y="319.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (13,638,065 samples, 0.02%)</title><rect x="1188.9" y="165" width="0.2" height="15.0" fill="rgb(247,154,46)" rx="2" ry="2" />
+<text  x="1191.89" y="175.5" ></text>
+</g>
+<g >
+<title>void DB::deserializeBinarySSE2&lt;1&gt;(DB::PODArray&lt;char8_t, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;&amp;, DB::PODArray&lt;unsigned long, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;&amp;, DB::ReadBuffer&amp;, unsigned long) (46,778,258 samples, 0.05%)</title><rect x="1189.4" y="197" width="0.6" height="15.0" fill="rgb(247,131,46)" rx="2" ry="2" />
+<text  x="1192.37" y="207.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::convertToBlockImpl&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, std::__1::vector&lt;DB::PODArray&lt;char*, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;*, std::__1::allocator&lt;DB::PODArray&lt;char*, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;*&gt; &gt;&amp;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, DB::Arena*, bool) const (6,818,047,124 samples, 7.83%)</title><rect x="1059.9" y="309" width="92.4" height="15.0" fill="rgb(237,131,35)" rx="2" ry="2" />
+<text  x="1062.88" y="319.5" >void DB::Ag..</text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;4ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::reserveForNextSize&lt;&gt;() (454,439,520 samples, 0.52%)</title><rect x="1146.1" y="229" width="6.2" height="15.0" fill="rgb(244,131,43)" rx="2" ry="2" />
+<text  x="1149.14" y="239.5" ></text>
+</g>
+</g>
+</svg>

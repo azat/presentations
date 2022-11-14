@@ -1,0 +1,1172 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+        <title>Know Your ClickHouse</title>
+
+        <link rel="stylesheet" href="dist/reset.css">
+        <link rel="stylesheet" href="dist/reveal.css">
+        <link rel="stylesheet" href="dist/theme/white.css">
+
+        <!-- Theme used for syntax highlighted code -->
+        <!-- List of themes are here: https://github.com/highlightjs/highlight.js/tree/main/src/styles -->
+        <link rel="stylesheet" href="plugin/highlight/monokai.css">
+
+        <style>
+            /* Do not capitalize the headers */
+            .reveal h1,
+            .reveal h2,
+            .reveal h3,
+            .reveal h4,
+            .reveal h5,
+            .reveal h6 {
+              text-transform: none;
+            }
+
+            /* Expand the code section */
+            .reveal pre code {
+                max-height: 800px;
+            }
+            .reveal pre.code-wrapper {
+                width: 77%;
+            }
+
+            #logo {
+                content: url(semrush-logo-main.png);
+                position: fixed;
+                top: 3.5em;
+                right: 3.5em;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="reveal">
+            <div class="slides">
+<section data-markdown>
+    <textarea data-template>
+        ## [Know Your ClickHouse](https://presentations.azat.sh/2022-know-your-clickhouse/)
+
+        #### _[Azat Khuzhin](https://azat.sh)_
+        #### _(a.khuzhin@semrush.com)_
+
+        notes:
+        - Plan:
+          - Will take a look on how builtin debugging techniques can be used for query/server debugging
+          - And cases when it is not possible to use builtin
+        - Speaker:
+          - I tried to make unique content
+          - I will try to mention links to patches and version since which the functionality is available
+          - Q/A section is follow
+
+        ---
+        ## Introduction
+
+        ClickHouse has extensive built in techniques and channels for debugging:
+
+        - various metrics/events
+          - `system.asynchronous_metrics`
+          - `system.metrics`
+          - `system.events`
+          - `system.*_log` analog
+
+        ---
+        - system tables
+        - `EXPLAIN`
+        - Memory profiler
+        - Query profiler
+        - _Processors profiler_
+        - prometheus exporter
+
+        notes:
+        - metrics - current values
+        - events - happened things
+
+        ---
+        There are so much of them, that it is easy to forgot about one of them.
+
+        And so I came up with the following picture:
+
+        (*Inspired by [Brendan's Gregg linux perf](https://brendangregg.com/linuxperf.html)*)
+
+        Notes:
+        - by analogy of Brendan's Gregg did for linux
+
+        ---
+
+        [![Know Your ClickHouse](Know-Your-ClickHouse.png)](https://github.com/azat/presentations/wiki/Know-Your-ClickHouse)
+
+        notes:
+        - Here you can see various subsystems and possible settings/places to visit for tracing, and also queries/settings for tunning/control
+        - I will get back to this picture at the end, and may give some description on topics that you will be interested in.
+        - Or here are some examples that I use:
+          - export custom metrics via custom http handlers
+          - send error log to elastic search and then to email/slack
+          - alerts via prometheus
+
+        ---
+        ### `system.asynchronous_metrics`
+
+        - internal ClickHouse metrics (that are not defined explicitly):
+          - metrics about replication
+          - memory related metrics
+          - threads
+          - various cache sizes (marks cache, compiled functions cache, uncompressed cache)
+
+        ---
+        ### `system.asynchronous_metrics`
+
+        - host metrics, analog of `node exporter`:
+          - CPU
+          - disk
+          - network
+          - memory (even EDAC)
+
+        _Since [21.8](https://github.com/ClickHouse/ClickHouse/pull/24416)_
+
+        See `asynchronous_metrics_update_period_s` config directive.
+
+        notes:
+        - it may consume lots of space in `system.asynchronous_metrics_log` (if it is enabled)
+
+        ---
+        ### `system.metrics`
+
+        Contains generic ClickHouse metrics (what happens now):
+
+        - various thread pools info (sizes, active tasks)
+        - memory
+        - io (files / network)
+        - queries
+        - MergeTree (parts)
+        - zookeeper
+        - locks
+
+        ---
+        ### `system.events`
+
+        Events, that is captured for server uptime, like:
+
+        - reads
+        - writes
+        - network
+        - memory
+        - per-Engine
+        - zookeeper operations
+
+        ---
+        ### `system.events`
+
+        Also, these events available on per-query basis in `system.query_log` table.
+
+        Column - `ProfileEvents`.
+
+        So, now, let's take a look at `system.query_log`
+
+        notes:
+        - We will play with different queries and compare those events (ProfileEvents)
+
+        ---
+        ### `query_log`
+
+        ```sql
+        SELECT count()
+        FROM system.query_log
+
+        Query id: d1bcddfe-a350-437e-a8c4-dc08ce3e7090
+
+        ┌───count()─┐
+        │ 319863073 │
+        └───────────┘
+        ```
+
+        <div class="fragment">Q: <code>count()</code> was very <b>fast</b>, and <b>did not show progress bar</b>, why?</div>
+        <div class="fragment">A: <code>optimize_trivial_count_query</code></div>
+
+        notes:
+        - Everybody knows about `query_log`
+        - For example, this, is how much data about queries we have on one of backlinks machines:
+        - There was some improvements in optimize_trivial_count_query recently (after projections had been introduced)
+
+        ---
+        ### `ProfileEvents`
+
+        Let's take a look events for our previous query:
+
+        ```sql [|8|13]
+        SELECT pe.1 AS event_name, pe.2 AS event_value
+        FROM
+        (
+          SELECT *
+          FROM system.query_log
+          WHERE (query_id='d1bcddfe-a350-437e-a8c4-dc08ce3e7090')
+            AND (type='QueryFinish')
+          SETTINGS asterisk_include_alias_columns = 1
+        )
+        ARRAY JOIN arrayZip(ProfileEvents.Names, ProfileEvents.Values) AS pe
+
+        Query id: 22ffbcc0-c62a-4895-8105-ee9d7447a643
+        15 rows in set. Elapsed: 73.979 sec. Processed 319.90 million rows, 372.41 GB (4.32 million rows/s., 5.03 GB/s.)
+        ```
+    </textarea>
+</section>
+
+<section>
+    <h3><code>ProfileEvents</code></h3>
+
+    <pre><code class="sql" data-noescape data-trim data-line-numbers="|5,10">
+    ┌─event_name─────────────────────┬─event_value─┐
+    ...
+    │ NetworkSendElapsedMicroseconds │          61 │
+    │ NetworkSendBytes               │        2323 │
+    │ SelectedRows                   │           1 │
+    │ SelectedBytes                  │        4104 │
+    │ RealTimeMicroseconds           │       11529 │
+    │ SystemTimeMicroseconds         │        7898 │
+    │ OSCPUVirtualTimeMicroseconds   │        7898 │
+    │ OSReadChars                    │         990 │
+    │ OSWriteChars                   │         866 │
+    └────────────────────────────────┴─────────────┘
+    </code></pre>
+
+    <div class="fragment">Indeed, <code>count()</code> query did not read anything</div>
+</section>
+
+<section data-markdown>
+    <textarea data-template>
+        ### `ProfileEvents`
+
+        But why query for obtaining `ProfileEvents` was slow?
+
+        ```sql
+        15 rows in set.
+          Elapsed: 73.979 sec.
+          Processed 319.90 million rows, 372.41 GB
+          (4.32 million rows/s., 5.03 GB/s.)
+        ```
+
+        Let's try to repeat, _after all_, this is what usually people do, right?
+
+        ---
+        ```sql [|13]
+        SELECT pe.1 AS event_name, pe.2 AS event_value
+        FROM
+        (
+          SELECT *
+          FROM system.query_log
+          WHERE (query_id='d1bcddfe-a350-437e-a8c4-dc08ce3e7090')
+            AND (type='QueryFinish')
+          SETTINGS asterisk_include_alias_columns = 1
+        )
+        ARRAY JOIN arrayZip(ProfileEvents.Names, ProfileEvents.Values) AS pe
+
+        Query id: d18fb820-4075-49bf-8fa3-cd7e53b9d523
+        15 rows in set. Elapsed: 18.999 sec. Processed 319.89 million rows, 372.40 GB (16.84 million rows/s., 19.60 GB/s.)     
+        ```
+
+        Faster, but still slow.
+
+        ---
+        Now let's make a pause, and take a look into the query:
+
+        <div class="fragment">Q: Why it is so slow?</div>
+        <div class="fragment">A: We did not pass neither <code>event_date</code> nor <code>event_time</code></div>
+
+        <div class="fragment">Q: What else?</div>
+        <div class="fragment">A: Plus all columns was requested</div>
+
+        ---
+        Does it read all columns?
+
+        <div class="fragment"><code>optimize_move_to_prewhere</code></div>
+
+        <div class="fragment">
+
+        ```sql
+        InterpreterSelectQuery: MergeTreeWhereOptimizer: condition
+          "(type = 'QueryFinish')
+            AND (query_id = 'd1bcddfe-a350-437e-a8c4-dc08ce3e7090')"
+          moved to PREWHERE
+        ```
+
+        _You can see this log with `send_logs_level=trace`_
+
+        </div>
+
+        ---
+        Will it even try to read all columns?
+
+        <div class="fragment">
+
+        This can be verified with `EXPLAIN PLAN` (or simply `EXPLAIN`):
+
+        ```sql [|1]
+        EXPLAIN PLAN header = 1
+        SELECT pe.1 AS event_name, pe.2 AS event_value
+        FROM
+        (
+          SELECT *
+          FROM system.query_log
+          WHERE (query_id='d1bcddfe-a350-437e-a8c4-dc08ce3e7090')
+            AND (type='QueryFinish')
+          SETTINGS asterisk_include_alias_columns = 1
+        )
+        ARRAY JOIN arrayZip(ProfileEvents.Names, ProfileEvents.Values) AS pe
+        ```
+
+        </div>
+    </textarea>
+</section>
+
+<section>
+    <h3>EXPLAIN</h3>
+
+    <pre><code class="sql" style="font-size: 20px; line-height: 20px;" data-noescape data-trim data-line-numbers="|16-18">
+    ┌─explain─────────────────────────────────────────────────────────────────────────┐
+    │ Expression ((Projection + Before ORDER BY))                                     │
+    │ Header: event_name String                                                       │
+    │         event_value UInt64                                                      │
+    │   ArrayJoin (ARRAY JOIN)                                                        │
+    │   Header: pe Tuple(String, UInt64)                                              │
+    │     Expression ((Before ARRAY JOIN + (Projection + Before ORDER BY)))           │
+    │     Header: pe Array(Tuple(String, UInt64))                                     │
+    │       Filter (WHERE)                                                            │
+    │       Header: ProfileEvents Map(String, UInt64)                                 │
+    │         SettingQuotaAndLimits (Set limits and quota after reading from storage) │
+    │         Header: equals(type, 'QueryFinish') UInt8                               │
+    │                 query_id String                                                 │
+    │                 ProfileEvents Map(String, UInt64)                               │
+    │           ReadFromMergeTree                                                     │
+    │           Header: equals(type, 'QueryFinish') UInt8                             │
+    │                   query_id String                                               │
+    │                   ProfileEvents Map(String, UInt64)                             │
+    └─────────────────────────────────────────────────────────────────────────────────┘
+    </code></pre>
+</section>
+
+<section>
+    <h3>Protection measure</h3>
+
+    <ul>
+        <li><code>force_index_by_date</code></li>
+        <li><code>force_primary_key</code></li>
+        <li><code>force_data_skipping_indices</code></li>
+    </ul>
+</section>
+
+<section>
+    <p>Now get back to those two queries (very slow and just slow)</p>
+
+    <p>Let's compare <code>ProfileEvents</code></p>
+</section>
+
+<section>
+    <pre style="width: 100%"><code class="sql" style="font-size: 14px; line-height: 14px;" data-noescape data-trim data-line-numbers="|2-12,13-23|30|25-28|31">
+    WITH
+        faster AS
+        (
+            SELECT pe.1 AS event_name, pe.2 AS event_value
+            FROM
+            (
+                SELECT ProfileEvents.Names, ProfileEvents.Values
+                FROM system.query_log
+                WHERE (query_id = 'd18fb820-4075-49bf-8fa3-cd7e53b9d523') AND (type = 'QueryFinish') AND (event_date = today())
+            )
+            ARRAY JOIN arrayZip(ProfileEvents.Names, ProfileEvents.Values) AS pe
+        ),
+        slower AS
+        (
+            SELECT pe.1 AS event_name, pe.2 AS event_value
+            FROM
+            (
+                SELECT ProfileEvents.Names, ProfileEvents.Values
+                FROM system.query_log
+                WHERE (query_id = '22ffbcc0-c62a-4895-8105-ee9d7447a643') AND (type = 'QueryFinish') AND (event_date = today())
+            )
+            ARRAY JOIN arrayZip(ProfileEvents.Names, ProfileEvents.Values) AS pe
+        )
+    SELECT
+        event_name,
+        formatReadableQuantity(slower.event_value) AS slower_value,
+        formatReadableQuantity(faster.event_value) AS faster_value,
+        round((slower.event_value - faster.event_value) / slower.event_value, 2) AS diff_q
+    FROM faster
+    LEFT JOIN slower USING (event_name)
+    WHERE diff_q > 0.05
+    ORDER BY event_name ASC
+    SETTINGS join_use_nulls = 1
+
+    Query id: 18c49832-5f32-4a08-8c8b-1ccabdcb5356
+
+    12 rows in set. Elapsed: 0.296 sec. Processed 1.29 million rows, 1.54 GB (4.34 million rows/s., 5.19 GB/s.)
+    </code></pre>
+</section>
+
+<section>
+    <pre style="width: 100%"><code class="sql" data-noescape data-trim data-line-numbers="|7">
+    ┌event_name───────────────────────┬slower_value───┬faster_value───┬diff_q┐
+    │DiskReadElapsedMicroseconds      │2.08 billion   │34.98 million  │  0.98│
+    │FileOpen                         │279.00         │253.00         │  0.09│
+    │MarkCacheMisses                  │13.00          │10.00          │  0.23│
+    │NetworkReceiveElapsedMicroseconds│3.28 thousand  │1.96 thousand  │   0.4│
+    │NetworkSendBytes                 │14.03 million  │5.24 million   │  0.63│
+    │OSReadBytes                      │51.61 billion  │106.50 thousand│     1│
+    │OpenedFileCacheMisses            │279.00         │253.00         │  0.09│
+    │RealTimeMicroseconds             │2.51 billion   │645.00 million │  0.74│
+    │Seek                             │4.94 thousand  │1.97 thousand  │   0.6│
+    │SelectedParts                    │55.00          │51.00          │  0.07│
+    │SelectedRanges                   │55.00          │51.00          │  0.07│
+    │SoftPageFaults                   │729.52 thousand│193.42 thousand│  0.73│
+    └─────────────────────────────────┴───────────────┴───────────────┴──────┘
+    </code></pre>
+
+    <aside class="notes" data-markdown>
+    - to evict files form page cache you can use `vmtouch`
+    </aside>
+</section>
+
+<section data-markdown>
+    <textarea data-template>
+        ### `EXPLAIN`
+
+        Let's confirm this with `EXPLAIN ESTIMATE`:
+
+        ```sql [|4,5,8]
+        EXPLAIN ESTIMATE
+        SELECT *
+        FROM system.query_log
+        WHERE (query_id = 'd1bcddfe-a350-437e-a8c4-dc08ce3e7090')
+          AND (type = 'QueryFinish')
+
+        ┌─database─┬─table─────┬─parts─┬──────rows─┬──marks─┐
+        │ system   │ query_log │    51 │ 319871121 │ 160641 │
+        └──────────┴───────────┴───────┴───────────┴────────┘
+        ```
+
+        ---
+        ### `EXPLAIN`
+
+        ```sql [|4-6,11]
+        EXPLAIN ESTIMATE
+        SELECT *
+        FROM system.query_log
+        WHERE (query_id = 'd1bcddfe-a350-437e-a8c4-dc08ce3e7090')
+          AND (type = 'QueryFinish')
+          AND (event_date = today())
+
+        Query id: 74d7b936-ebf1-4fb1-815a-b7b2b00c129d
+
+        ┌─database─┬─table─────┬─parts─┬───rows─┬─marks─┐
+        │ system   │ query_log │    11 │ 643731 │   340 │
+        └──────────┴───────────┴───────┴────────┴───────┘
+        ```
+
+        ---
+        ### `EXPLAIN`
+
+        ```sql [|5-7,12]
+        EXPLAIN ESTIMATE
+        SELECT *
+        FROM system.query_log
+        WHERE (query_id = 'd1bcddfe-a350-437e-a8c4-dc08ce3e7090')
+          AND (type = 'QueryFinish')
+          AND (event_date = today())
+          AND (event_time > (now() - toIntervalHour(1)))
+
+        Query id: a0157550-b398-4c4a-b5ed-22d66fd8e718
+
+        ┌─database─┬─table─────┬─parts─┬──rows─┬─marks─┐
+        │ system   │ query_log │     6 │ 50321 │    31 │
+        └──────────┴───────────┴───────┴───────┴───────┘
+        ```
+
+        ---
+        ## Caches
+
+        ---
+        ### Page cache
+
+        Apart from `OSReadBytes`
+
+        _`/proc/thread-self/io::read_bytes`_
+
+        There is also `OSReadChars`
+
+        _`/proc/thread-self/io::rchar`_
+
+        ---
+        ### Page cache
+        ```sql
+        WITH
+          ProfileEvents['OSReadChars'] - ProfileEvents['OSReadBytes']
+            AS from_page_cache,
+          from_page_cache / ProfileEvents['OSReadChars']
+            AS page_cache_usage
+        SELECT
+          event_date,
+          round(avg(page_cache_usage), 2) AS from_cache
+        FROM system.query_log
+        WHERE (event_date >= (today() - 7))
+          AND ((ProfileEvents['OSReadChars']) > 0)
+          AND ((ProfileEvents['OSReadBytes']) > 0)
+          AND ((ProfileEvents['OSReadChars']) >
+               (ProfileEvents['OSReadBytes']))
+        GROUP BY event_date
+        ```
+
+        ---
+        ### Page cache
+
+        ```sql
+        ┌─event_date─┬─from_cache─┐
+        │ 2022-04-08 │       0.56 │
+        │ 2022-04-09 │       0.56 │
+        │ 2022-04-10 │       0.57 │
+        │ 2022-04-11 │       0.54 │
+        │ 2022-04-12 │       0.58 │
+        │ 2022-04-13 │       0.57 │
+        │ 2022-04-14 │       0.57 │
+        │ 2022-04-15 │       0.57 │
+        └────────────┴────────────┘
+        ```
+
+        notes:
+        - These metrics are inaccurate
+
+        ---
+        ### Uncompressed cache
+
+        ```sql
+        WITH
+            ProfileEvents['UncompressedCacheHits'] AS cache_hits,
+            ProfileEvents['UncompressedCacheMisses'] AS cache_misses,
+            if(cache_hits OR cache_misses,
+               cache_hits / (cache_hits + cache_misses),
+               0) AS cache_hits_q
+        SELECT
+            event_date,
+            round(avg(cache_hits_q), 2) AS avg_hits_q
+        FROM system.query_log
+        WHERE event_date >= (today() - 7)
+        GROUP BY event_date
+        ```
+
+        ---
+        ### Uncompressed cache
+
+        ```sql
+        ┌─event_date─┬─avg_hits_q─┐
+        │ 2022-04-08 │       0.16 │
+        │ 2022-04-09 │       0.14 │
+        │ 2022-04-10 │       0.14 │
+        │ 2022-04-11 │       0.18 │
+        │ 2022-04-12 │       0.18 │
+        │ 2022-04-13 │       0.17 │
+        │ 2022-04-14 │       0.18 │
+        │ 2022-04-15 │       0.18 │
+        └────────────┴────────────┘
+        ```
+
+        ---
+        ### Marks cache
+
+        ```sql
+        WITH
+            ProfileEvents['MarkCacheHits'] AS cache_hits,
+            ProfileEvents['MarkCacheMisses'] AS cache_misses,
+            if(cache_hits OR cache_misses,
+               cache_hits / (cache_hits + cache_misses),
+               0) AS cache_hits_q
+        SELECT
+            event_date,
+            round(avg(cache_hits_q), 2) AS avg_hits_q
+        FROM system.query_log
+        WHERE event_date >= (today() - 7)
+        GROUP BY event_date
+        ```
+
+        ---
+        ### Marks cache
+
+        ```sql
+        ┌─event_date─┬avg_hits_q─┐
+        │ 2022-04-08 │      0.52 │
+        │ 2022-04-09 │       0.5 │
+        │ 2022-04-10 │       0.5 │
+        │ 2022-04-11 │      0.54 │
+        │ 2022-04-12 │      0.53 │
+        │ 2022-04-13 │      0.52 │
+        │ 2022-04-14 │      0.53 │
+        │ 2022-04-15 │      0.53 │
+        └────────────┴───────────┘
+        ```
+    </textarea>
+</section>
+
+<section>
+    <h3>How Marks/Uncompressed/page cache helps</h3>
+
+    <pre><code class="sql" style="font-size: 16px; line-height: 16px;" data-noescape data-trim data-line-numbers="|5-7,19-20|8-10,21-22|11-16,23-24|27">
+    SELECT COLUMNS('q90') APPLY x -> round(avg(x), 2)
+    FROM
+    (
+        WITH
+            ProfileEvents['MarkCacheHits'] AS m_hits,
+            ProfileEvents['MarkCacheMisses'] AS m_misses,
+            if(m_hits OR m_misses, m_hits / (m_hits + m_misses), 0) AS m_hits_q,
+            ProfileEvents['UncompressedCacheHits'] AS u_hits,
+            ProfileEvents['UncompressedCacheMisses'] AS u_misses,
+            if(u_hits OR u_misses, u_hits / (u_hits + u_misses), 0) AS u_hits_q,
+            ProfileEvents['OSReadChars'] AS read_chars,
+            ProfileEvents['OSReadBytes'] AS read_bytes,
+            read_chars - read_bytes AS page_cache_hit_bytes,
+            if((read_chars > 0) AND (read_bytes > 0) AND (read_chars > read_bytes),
+               page_cache_hit_bytes / read_chars,
+               0) AS p_hits_q
+        SELECT
+            normalized_query_hash,
+            quantileExactIf(0.9)(query_duration_ms, m_hits_q < 0.5) AS m_hit_0_50_q90,
+            quantileExactIf(0.9)(query_duration_ms, m_hits_q >= 0.5) AS m_hit_50_100_q90,
+            quantileExactIf(0.9)(query_duration_ms, u_hits_q < 0.5) AS u_hit_0_50_q90,
+            quantileExactIf(0.9)(query_duration_ms, u_hits_q >= 0.5) AS u_hit_50_100_q90
+            quantileExactIf(0.9)(query_duration_ms, p_hits_q < 0.5) AS p_hit_0_50_q90,
+            quantileExactIf(0.9)(query_duration_ms, p_hits_q >= 0.5) AS p_hit_50_100_q90,
+        FROM system.query_log
+        WHERE event_date >= yesterday()
+        GROUP BY normalized_query_hash
+    )
+    </code></pre>
+
+    <aside class="notes" data-markdown>
+    - `normalized_query_hash` does not contains literals, so this means that it is the hash of type of query/report, not particular report
+    </aside>
+</section>
+
+<section>
+    <h3>How Marks/Uncompressed/page cache helps</h3>
+
+    <pre><code class="sql" data-noescape data-trim data-line-numbers="|3-4|5-6|7-8">
+    Row 1:
+    ──────
+    round(avg(m_hit_0_50_q90), 2):   16238.45
+    round(avg(m_hit_50_100_q90), 2): 1478.91
+    round(avg(u_hit_0_50_q90), 2):   16739.76
+    round(avg(u_hit_50_100_q90), 2): 971.83
+    round(avg(p_hit_0_50_q90), 2):   17373.8
+    round(avg(p_hit_50_100_q90), 2): 1049.97
+    </code></pre>
+</section>
+
+<section data-markdown>
+    <textarea data-template>
+        ## Intermediate summary
+
+        - Use `EXPLAIN`
+        - Look at `system.query_log`
+        - Look at `ProfileEvents`
+        - _Look at query execution look (`send_logs_level=trace`)_
+        - You may want to increase cache/memory.
+
+          _But be careful and see if this is required_
+
+        ---
+        ## Memory
+
+        If you are using ClickHouse for OLAP queries, you are familiar with **`Memory limit exceeded`** error.
+
+        ---
+        It is important to note, that there are there types of errors:
+
+        - `Memory limit exceeded` **`(for query)`**
+
+          _`max_memory_usage`_
+
+        - `Memory limit exceeded` **`(for user)`**
+
+          _`max_memory_usage_for_user`_
+
+        - `Memory limit exceeded` **`(total)`**
+
+          _`max_server_memory_usage`_ (to avoid OOM)
+
+        ---
+        ### `Memory limit exceeded (for user)`
+
+        Under normal circumstances the only reason - other user queries:
+
+        ```sql
+        SELECT
+            user,
+            formatReadableSize(sum(memory_usage) AS mem_sum) AS memory
+        FROM system.processes
+        GROUP BY user
+        HAVING mem_sum > 0
+
+        ┌─user───────┬─memory─────┐
+        │ bl_backend │ 12.73 MiB  │
+        │ bl_indexer │ 4.13 MiB   │
+        └────────────┴────────────┘
+        ```
+
+        ---
+        ### `Memory limit exceeded (total)`
+
+        There are various things that ClickHouse could do in background
+
+        - merges
+        - Buffer tables
+        - Memory tables
+        - Join tables
+        - various caches
+        - ...
+
+        ---
+        The most accurate metric to get is RSS of the process, or `MemoryTracking` from `system.events` (since it is "synced" with RSS anyway).
+
+        <p class="fragment">But it does not explain who eats memory, you can run the following query to get some details.</p>
+
+        <p class="fragment">But there are lots of system tables, where you can get detailed memory usage as follow:</p>
+    </textarea>
+</section>
+
+<section>
+    <pre style="width: 100%;"><code class="sql" style="font-size: 16px; line-height: 18px" data-noescape data-trim data-line-numbers="|2|4,7,9,11,13,15,17,19|21-23|25-27">
+    WITH
+        (SELECT value FROM system.metrics WHERE metric = 'MemoryTracking') AS rss,
+        (
+            SELECT sum(bytes) AS bytes
+            FROM
+            (
+                SELECT sum(total_bytes) AS bytes FROM system.tables WHERE engine IN ('Join','Memory','Buffer','Set')
+                UNION ALL
+                SELECT sum(value::UInt64) AS bytes FROM system.asynchronous_metrics WHERE metric LIKE '%CacheBytes'
+                UNION ALL
+                SELECT sum(memory_usage::UInt64) AS bytes FROM system.processes
+                UNION ALL
+                SELECT sum(memory_usage::UInt64) AS bytes FROM system.merges
+                UNION ALL
+                SELECT sum(bytes_allocated) AS bytes FROM system.dictionaries
+                UNION ALL
+                SELECT sum(primary_key_bytes_in_memory_allocated) AS bytes FROM system.parts
+            )
+        ) AS used_memory
+    SELECT
+        formatReadableSize(rss) AS rss_,
+        formatReadableSize(used_memory) AS used_memory_,
+        formatReadableSize(rss - used_memory) AS fragmentation_
+
+    ┌─rss_───────┬─used_memory_─┬─fragmentation_─┐
+    │ 216.20 GiB │ 208.23 GiB   │ 7.97 GiB       │
+    └────────────┴──────────────┴────────────────┘
+    </code></pre>
+</section>
+
+<section>
+    <h3><code>Memory limit exceeded (for query)</code></h3>
+
+    <p>Let's run the following query</p>
+
+    <pre><code class="sql" data-noescape data-trim data-line-numbers="|2|3-4|8|12-14">
+    SELECT event_type, repo_name, actor_login, count()
+    FROM github_events
+    GROUP BY event_type, repo_name, actor_login
+    ORDER BY count() DESC
+    LIMIT 10
+
+    ↑ Progress: 1.29 billion rows, 17.82 GB (141.08 million rows/s., 1.95 GB/s.) ███████████████████████████████▍
+          (32.1 CPU, 33.91 GB RAM) 40%
+    0 rows in set. Elapsed: 10.113 sec. Processed 1.29 billion rows, 17.82 GB (127.45 million rows/s., 1.76 GB/s.)
+
+    Received exception from server (version 22.2.1):
+    Code: 241. DB::Exception: Received from localhost:9000. DB::Exception:
+        Memory limit (for query) exceeded: would use 32.00 GiB (attempt to allocate chunk of 4555008 bytes),
+        maximum: 32.00 GiB: While executing AggregatingTransform. (MEMORY_LIMIT_EXCEEDED)
+    </code></pre>
+</section>
+
+<section>
+    You may use external <code>GROUP BY</code>/<code>ORDER BY</code>:
+
+    <pre><code class="sql" data-noescape data-trim data-line-numbers="|7-9|11-13">
+    SELECT event_type, repo_name, actor_login, count()
+    FROM github_events
+    GROUP BY event_type, repo_name, actor_login
+    ORDER BY count() DESC
+    LIMIT 10
+    SETTINGS
+        max_bytes_before_external_group_by = '1G',
+        max_bytes_before_external_sort = '1G',
+        max_threads = 16
+
+    10 rows in set.  Elapsed: 181.615 sec.
+        Processed 3.12 billion rows, 46.56 GB
+        (17.18 million rows/s., 256.39 MB/s.)
+    </code></pre>
+
+    <aside class="notes" data-markdown>
+    - max_bytes_before_external_group_by/max_bytes_before_external_sort - per-thread limit, that's why it is so small
+    </aside>
+</section>
+
+<section>
+    But what if I just want to see where it uses the memory:
+
+    <pre><code class="sql" data-noescape data-trim data-line-numbers="|7|8|11-13">
+    SELECT event_type, repo_name, actor_login, count()
+    FROM github_events
+    GROUP BY event_type, repo_name, actor_login
+    ORDER BY count() DESC
+    LIMIT 10
+    SETTINGS
+        max_memory_usage = '256Gi',
+        memory_profiler_sample_probability = 1
+
+    Query id: 1b1d1608-40f9-448a-84ae-a199ca76156d
+    10 rows in set. Elapsed: 72.430 sec.
+        Processed 3.12 billion rows, 46.53 GB
+        (43.07 million rows/s., 642.35 MB/s.)
+    </code></pre>
+
+    <aside class="notes" data-markdown>
+    - not all allocation will be tracked, see also max_untracked_memory
+    </aside>
+</section>
+
+<section>
+    <pre style="width: 100%;"><code class="sql" data-noescape data-trim data-line-numbers="">
+    ┌─event_type──┬─repo_name───────────────────────┬─actor_login─────┬─count()─┐
+    │ PushEvent   │ peter-clifford/grax-hd-trial    │ peter-clifford  │ 3097263 │
+    │ PushEvent   │ Lombiq/Orchard                  │ LombiqBot       │ 2471077 │
+    │ CreateEvent │ eclipse/eclipse.platform.common │ eclipse         │ 1889286 │
+    │ PushEvent   │ unitydemo2/Docworks             │ unitydemo2      │ 1779811 │
+    │ PushEvent   │ commit-b0t/commit-b0t           │ commit-b0t      │ 1688188 │
+    │ PushEvent   │ KenanSulayman/heartbeat         │ KenanSulayman   │ 1595611 │
+    │ PushEvent   │ chuan12/shenzhouzd              │ chuan12         │ 1449096 │
+    │ PushEvent   │ othhotro/Roo.Exe                │ othhotro        │ 1437709 │
+    │ CreateEvent │ direwolf-github/my-app          │ direwolf-github │ 1426236 │
+    │ DeleteEvent │ direwolf-github/my-app          │ direwolf-github │ 1425781 │
+    └─────────────┴─────────────────────────────────┴─────────────────┴─────────┘
+    </code></pre>
+</section>
+
+<section data-markdown>
+    <textarea data-template>
+        Q: Now how can we analyze memory usage for the query?
+
+        <p class="fragment">A: <a href="https://www.brendangregg.com/FlameGraphs/memoryflamegraphs.html">memory flamegraph</a></p>
+
+        ---
+        ```sh [|8|3-6|10-12|13,7|14-16]
+        clickhouse-client --allow_introspection_functions=1 --query "
+          SELECT
+            arrayStringConcat(arrayMap(
+              addr -> demangle(addressToSymbol(addr)),
+              arrayReverse(trace)
+            ), ';') AS human_trace,
+            sum(abs(size))
+          FROM system.trace_log
+          WHERE (event_date = today())
+            AND (query_id = '1b1d1608-40f9-448a-84ae-a199ca76156d')
+            AND (trace_type = 'Memory')
+            AND (size > 0)
+          GROUP BY human_trace
+          FORMAT TSV
+        " | flamegraph.pl --hash --title 'Memory' >| \
+          flamegraphs/memory.svg
+        ```
+
+        ---
+        [![memory flamegraph](flamegraphs/memory.svg)](flamegraphs/memory.svg)
+
+        ---
+        ### Memory summary
+
+        - You can tune memory limits
+        - There is external `GROUP BY`/`ORDER BY`
+        - You can use flamegraph for your own programs
+
+        See also:
+
+        - [brendangregg/FlameGraph](https://github.com/brendangregg/FlameGraph)
+        - [compare.sh](https://github.com/ClickHouse/ClickHouse/blob/master/docker/test/performance-comparison/compare.sh)
+
+        ---
+        ### Query profiler
+
+        Let's take a look at this query one more time, but now, in terms of query profiler:
+
+        ```sql [|9-10]
+        SELECT event_type, repo_name, actor_login, count()
+        FROM github_events
+        GROUP BY event_type, repo_name, actor_login
+        ORDER BY count() DESC
+        LIMIT 10
+        SETTINGS
+            max_memory_usage = '256Gi',
+            memory_profiler_sample_probability = 1,
+            query_profiler_cpu_time_period_ns = 1e9,
+            query_profiler_real_time_period_ns = 1e9
+
+        Query id: 1b1d1608-40f9-448a-84ae-a199ca76156d
+        ```
+
+        ---
+        Now, let's built one more [flamegraph](https://www.brendangregg.com/flamegraphs.html):
+
+        ```sh [|11,7]
+        clickhouse-client --allow_introspection_functions=1 --query "
+          SELECT
+            arrayStringConcat(arrayMap(
+              addr -> demangle(addressToSymbol(addr)),
+              arrayReverse(trace)
+            ), ';') AS human_trace,
+            count()
+          FROM system.trace_log
+          WHERE (event_date = today())
+            AND (query_id = '1b1d1608-40f9-448a-84ae-a199ca76156d')
+            AND (trace_type = 'Real')
+          GROUP BY human_trace
+          FORMAT TSV
+        " | tee flamegraphs/real.tsv | \
+          flamegraph.pl --hash --title 'Real' >| \
+          flamegraphs/real.svg
+
+        ---
+        [![Real flamegraph](flamegraphs/real.svg)](flamegraphs/real.svg)
+
+        notes:
+        - we can see ColumnUnique due to GROUP BY
+        - and we also see that reading from disk does not takes too much time
+
+        ---
+        ```sh [|7,11]
+        clickhouse-client --allow_introspection_functions=1 --query "
+          SELECT
+            arrayStringConcat(arrayMap(
+              addr -> demangle(addressToSymbol(addr)),
+              arrayReverse(trace)
+            ), ';') AS human_trace,
+            count()
+          FROM system.trace_log
+          WHERE (event_date = today())
+            AND (query_id = '1b1d1608-40f9-448a-84ae-a199ca76156d')
+            AND (trace_type = 'CPU')
+          GROUP BY human_trace
+          FORMAT TSV
+        " | tee flamegraphs/cpu.tsv | \
+          flamegraph.pl --hash --title 'CPU' >| \
+          flamegraphs/cpu.svg
+        ```
+
+        ---
+        [![CPU flamegraph](flamegraphs/cpu.svg)](flamegraphs/cpu.svg)
+
+        ---
+        ### CPU vs Real
+
+        And since this query does not wait any IO/network CPU and Real is the same.
+
+        Let's build a flamegraph diff:
+
+        ```sh
+        difffolded.pl flamegraphs/real.tsv flamegraphs/cpu.tsv | \
+          flamegraph.pl > \
+          flamegraphs/cpu.vs.real.svg
+        ```
+
+        notes:
+        - but ClickHouse not that optimal here, so it sometimes may be triggered, since there is polling each few ms
+
+        ---
+        [![Real vs CPU](flamegraphs/cpu.vs.real.svg)](flamegraphs/cpu.vs.real.svg)
+
+        ---
+        ### Query profiler summary
+
+        Can be useful to see where query spent time.
+
+        But flamegraphs are not always that understandable for regular user
+
+        <div class="fragment">
+
+        Maybe there is a way to show time spent for:
+        - GROUP BY
+        - ORDER BY
+        - reading
+
+        </div>
+
+        ---
+        ### Profiling on processors level
+
+        Each query execution pipeline is implemented as processors:
+
+        - `GROUP BY`
+          - `AggregatingTransform`
+          - `ConvertingAggregatedToChunksSource`
+        - `ORDER BY`
+          - `MergeSortingTransform`
+          - `PartialSortingTransform`
+    </textarea>
+</section>
+
+<section>
+    Let's use <code>EXPLAIN PIPELINE</code> to get those <b>processors</b>:
+
+    <pre style="width: 35%;"><code class="sql" data-noescape data-trim data-line-numbers="|1">
+    EXPLAIN PIPELINE
+    SELECT
+        event_type,
+        repo_name,
+        actor_login,
+        count()
+    FROM github_events
+    GROUP BY
+        event_type,
+        repo_name,
+        actor_login
+    ORDER BY count() DESC
+    LIMIT 10
+    </code></pre>
+
+    <a href="https://github.com/ClickHouse/ClickHouse/pull/34355">Available since 22.4+</a>
+</section>
+
+<section>
+    <pre style="width: 70%"><code class="sql" style="font-size: 22px; line-height: 22px;" data-noescape data-trim data-line-numbers="|20,19,14,9,7">
+    ┌─explain──────────────────────────────────────────┐
+    │ (Expression)                                     │
+    │ ExpressionTransform                              │
+    │   (Limit)                                        │
+    │   Limit                                          │
+    │     (Sorting)                                    │
+    │     MergeSortingTransform                        │
+    │       LimitsCheckingTransform                    │
+    │         PartialSortingTransform                  │
+    │           (Expression)                           │
+    │           ExpressionTransform                    │
+    │             (Aggregating)                        │
+    │             Resize 32 → 1                        │
+    │               AggregatingTransform × 32          │
+    │                 StrictResize 32 → 32             │
+    │                   (Expression)                   │
+    │                   ExpressionTransform × 32       │
+    │                     (SettingQuotaAndLimits)      │
+    │                       (ReadFromMergeTree)        │
+    │                       MergeTreeThread × 32 0 → 1 │
+    └──────────────────────────────────────────────────┘
+    </code></pre>
+</section>
+
+<section>
+    <pre><code class="sql" data-noescape data-trim data-line-numbers="|15">
+SELECT
+    event_type,
+    repo_name,
+    actor_login,
+    count()
+FROM github_events
+GROUP BY
+    event_type,
+    repo_name,
+    actor_login
+ORDER BY count() DESC
+LIMIT 10
+SETTINGS
+    max_memory_usage = '256Gi',
+    log_processors_profiles = 1
+
+Query id: d7edb6c5-d0ce-4baf-87d4-68b5721ff6d9
+10 rows in set. Elapsed: 73.262 sec. Processed 3.12 billion rows, 46.53 GB (42.58 million rows/s., 635.06 MB/s.)
+    </code></pre>
+</section>
+
+<section>
+    <pre style="width: 100%;"><code class="sql" data-noescape data-trim data-line-numbers="|12-17">
+    SELECT
+        name,
+        sum(elapsed_us) / 1e6 AS elapsed,
+        sum(need_data_elapsed_us) / 1e6 AS in_wait,
+        sum(port_full_elapsed_us) / 1e6 AS out_wait
+    FROM system.processors_profile_log
+    WHERE query_id = 'd7edb6c5-d0ce-4baf-87d4-68b5721ff6d9'
+    GROUP BY name
+    HAVING elapsed > 2
+    ORDER BY elapsed DESC
+
+    ┌─name───────────────────────────────┬─────elapsed─┬────in_wait─┬───out_wait─┐
+    │ ConvertingAggregatedToChunksSource │ 1367.418025 │   0.004434 │   4.955902 │
+    │ AggregatingTransform               │  646.475021 │ 138.036601 │  35.994973 │
+    │ MergeTreeThread                    │  126.220384 │   0.037104 │ 647.360237 │
+    │ PartialSortingTransform            │    2.502141 │  64.940476 │   1.745577 │
+    └────────────────────────────────────┴─────────────┴────────────┴────────────┘
+    </code></pre>
+
+    <aside class="notes" data-markdown>
+    - here is a time for the query if it had been executed with max_threads=1, and iff scaling is linear
+    </aside>
+</section>
+
+<section data-markdown>
+    <textarea data-template>
+        ### Summary
+
+        - system tables
+        - `EXPLAIN`
+        - `query_log` and `ProfileEvents`
+        - Memory profiler (`memory_profiler_sample_probability`)
+        - Query profiler (`query_profiler_{cpu,real}_time_period_ns`)
+        - Processors profiler (`log_processors_profiles`)
+
+        ---
+        Thank you.
+
+        Questions?
+
+        ---
+        [![Know Your ClickHouse](Know-Your-ClickHouse.png)](https://github.com/azat/presentations/wiki/Know-Your-ClickHouse)
+
+        ---
+        ### Easter egg
+
+        For a curious reader there is [another presentation](index_c_developer_version.html), that contains more low-level debugging.
+    </textarea>
+</section>
+            </div>
+        </div>
+
+        <script src="dist/reveal.js"></script>
+        <script src="plugin/notes/notes.js"></script>
+        <script src="plugin/markdown/markdown.js"></script>
+        <script src="plugin/highlight/highlight.js"></script>
+        <script>
+            // More info about initialization & config:
+            // - https://revealjs.com/initialization/
+            // - https://revealjs.com/config/
+            Reveal.initialize({
+                hash: true,
+
+                width: '90%',
+                height: '90%',
+
+                // Learn about plugins: https://revealjs.com/plugins/
+                plugins: [ RevealMarkdown, RevealHighlight, RevealNotes ],
+            });
+
+            function logoSwitcher(event)
+            {
+                if (event.indexh > 0) {
+                    document.getElementById('logo').style.content = 'url(semrush-logo-tiny.png)';
+                } else {
+                    document.getElementById('logo').style.content = 'url(semrush-logo-main.png)';
+                }
+            }
+
+            Reveal.on('slidechanged', logoSwitcher);
+            Reveal.on('ready', logoSwitcher);
+        </script>
+
+        <div id="logo"></div>
+    </body>
+</html>

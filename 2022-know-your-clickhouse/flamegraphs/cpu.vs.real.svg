@@ -1,0 +1,1756 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="630" onload="init(evt)" viewBox="0 0 1200 630" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="630.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="613" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="613" > </text>
+<g id="frames">
+<g >
+<title>large_ralloc (4 samples, 0.20%; 0.00%)</title><rect x="740.2" y="229" width="2.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="743.20" y="239.5" ></text>
+</g>
+<g >
+<title>libunwind::UnwindCursor&lt;libunwind::LocalAddressSpace, libunwind::Registers_x86_64&gt;::getInfoFromDwarfSection(unsigned long, libunwind::UnwindInfoSections const&amp;, unsigned int) (2 samples, 0.10%; 0.00%)</title><rect x="313.4" y="277" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="316.41" y="287.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (2 samples, 0.10%; 0.00%)</title><rect x="1165.8" y="165" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1168.80" y="175.5" ></text>
+</g>
+<g >
+<title>__libc_realloc (41 samples, 2.05%; 0.00%)</title><rect x="314.6" y="357" width="24.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="317.59" y="367.5" >_..</text>
+</g>
+<g >
+<title>DB::AggregatingTransform::consume(DB::Chunk) (614 samples, 30.72%; 0.00%)</title><rect x="61.9" y="437" width="362.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="64.95" y="447.5" >DB::AggregatingTransform::consume(DB::Chunk)</text>
+</g>
+<g >
+<title>MemoryTracker::free(long) (1 samples, 0.05%; 0.00%)</title><rect x="422.6" y="341" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.62" y="351.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (15 samples, 0.75%; +0.25%)</title><rect x="1159.9" y="213" width="8.8" height="15.0" fill="rgb(255,194,194)" rx="2" ry="2" />
+<text  x="1162.89" y="223.5" ></text>
+</g>
+<g >
+<title>extent_split_interior (1 samples, 0.05%; 0.00%)</title><rect x="1146.9" y="85" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1149.91" y="95.5" ></text>
+</g>
+<g >
+<title>DB::CompressionCodecLZ4::doDecompressData(char const*, unsigned int, char*, unsigned int) const (6 samples, 0.30%; 0.00%)</title><rect x="1176.4" y="229" width="3.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1179.42" y="239.5" ></text>
+</g>
+<g >
+<title>malloc_default (2 samples, 0.10%; 0.00%)</title><rect x="1135.1" y="165" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="175.5" ></text>
+</g>
+<g >
+<title>extent_recycle.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="1146.9" y="101" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1149.91" y="111.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::free(long) (1 samples, 0.05%; 0.00%)</title><rect x="427.9" y="309" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="430.93" y="319.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::createAggregateStates&lt;false&gt;(char*&amp;) const (3 samples, 0.15%; 0.00%)</title><rect x="420.3" y="373" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="423.26" y="383.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeReaderWide::readData(DB::NameAndTypePair const&amp;, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;&amp;, unsigned long, bool, unsigned long, unsigned long, std::__1::unordered_map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::hash&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::equal_to&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt; &gt;&amp;, bool) (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="293" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="303.5" >DB::Me..</text>
+</g>
+<g >
+<title>bool LZ4::(anonymous namespace)::decompressImpl&lt;16ul, true&gt;(char const*, char*, unsigned long, unsigned long) (.llvm.5035804696300559578) (4 samples, 0.20%; -0.10%)</title><rect x="1176.4" y="197" width="2.4" height="15.0" fill="rgb(203,203,255)" rx="2" ry="2" />
+<text  x="1179.42" y="207.5" ></text>
+</g>
+<g >
+<title>libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::parseInstructions(libunwind::LocalAddressSpace&amp;, unsigned long, unsigned long, libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::CIE_Info const&amp;, unsigned long, libunwind::PrologInfoStackEntry*&amp;, int, libunwind::PrologInfo*, libunwind::StackGuard&amp;) (1 samples, 0.05%; +0.05%)</title><rect x="422.6" y="261" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="425.62" y="271.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Index::checkSizeOfType() (2 samples, 0.10%; -0.05%)</title><rect x="475.7" y="309" width="1.2" height="15.0" fill="rgb(206,206,255)" rx="2" ry="2" />
+<text  x="478.74" y="319.5" ></text>
+</g>
+<g >
+<title>DB::ColumnString::serializeValueIntoArena(unsigned long, DB::Arena&amp;, char const*&amp;) const (83 samples, 4.15%; -0.45%)</title><rect x="338.8" y="373" width="49.0" height="15.0" fill="rgb(182,182,255)" rx="2" ry="2" />
+<text  x="341.79" y="383.5" >DB::..</text>
+</g>
+<g >
+<title>__libc_realloc (1 samples, 0.05%; 0.00%)</title><rect x="1167.6" y="181" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1170.57" y="191.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::ColumnString::indexImpl&lt;unsigned short&gt;(DB::PODArray&lt;unsigned short, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt; const&amp;, unsigned long) const (1 samples, 0.05%; 0.00%)</title><rect x="1150.5" y="181" width="0.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1153.45" y="191.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::~ColumnLowCardinality() (3 samples, 0.15%; 0.00%)</title><rect x="422.0" y="421" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.03" y="431.5" ></text>
+</g>
+<g >
+<title>DB::recursiveRemoveLowCardinality(COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; const&amp;) (53 samples, 2.65%; 0.00%)</title><rect x="64.9" y="405" width="31.3" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="67.90" y="415.5" >DB..</text>
+</g>
+<g >
+<title>DB::ISimpleTransform::transform(DB::Chunk&amp;, DB::Chunk&amp;) (3 samples, 0.15%; 0.00%)</title><rect x="424.4" y="437" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="427.39" y="447.5" ></text>
+</g>
+<g >
+<title>syscall (1 samples, 0.05%; +0.05%)</title><rect x="422.0" y="277" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="425.03" y="287.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;1ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1189.4" y="565" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1192.41" y="575.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (2 samples, 0.10%; +0.10%)</title><rect x="1154.0" y="181" width="1.2" height="15.0" fill="rgb(255,203,203)" rx="2" ry="2" />
+<text  x="1156.99" y="191.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (17 samples, 0.85%; 0.00%)</title><rect x="726.6" y="277" width="10.1" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="729.62" y="287.5" ></text>
+</g>
+<g >
+<title>arena_decay_impl.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="744.3" y="197" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="207.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::allocNoTrack(unsigned long, unsigned long) (2 samples, 0.10%; 0.00%)</title><rect x="1135.1" y="181" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="191.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::ColumnString::indexImpl&lt;unsigned short&gt;(DB::PODArray&lt;unsigned short, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt; const&amp;, unsigned long) const (4 samples, 0.20%; +0.05%)</title><rect x="1169.3" y="229" width="2.4" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1172.34" y="239.5" ></text>
+</g>
+<g >
+<title>DB::ColumnString::index(DB::IColumn const&amp;, unsigned long) const (1 samples, 0.05%; 0.00%)</title><rect x="1150.5" y="213" width="0.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1153.45" y="223.5" ></text>
+</g>
+<g >
+<title>HashTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;::reinsert(HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;&amp;, unsigned long) (32 samples, 1.60%; +0.55%)</title><rect x="400.8" y="373" width="18.9" height="15.0" fill="rgb(255,176,176)" rx="2" ry="2" />
+<text  x="403.78" y="383.5" ></text>
+</g>
+<g >
+<title>void HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;::forEachValue&lt;void DB::Aggregator::convertToBlockImplFinal&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;, false, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, std::__1::vector&lt;DB::IColumn*, std::__1::allocator&lt;DB::IColumn*&gt; &gt;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, DB::Arena*) const::\'lambda\'(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt; const&amp;, auto&amp;)&gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;&amp;) (714 samples, 35.72%; +0.30%)</title><rect x="455.1" y="341" width="421.5" height="15.0" fill="rgb(255,191,191)" rx="2" ry="2" />
+<text  x="458.08" y="351.5" >void HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;Str..</text>
+</g>
+<g >
+<title>libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::parseInstructions(libunwind::LocalAddressSpace&amp;, unsigned long, unsigned long, libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::CIE_Info const&amp;, unsigned long, libunwind::PrologInfoStackEntry*&amp;, int, libunwind::PrologInfo*, libunwind::StackGuard&amp;) (1 samples, 0.05%; +0.05%)</title><rect x="61.9" y="309" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="64.95" y="319.5" ></text>
+</g>
+<g >
+<title>large_dalloc (1 samples, 0.05%; 0.00%)</title><rect x="419.7" y="373" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="422.66" y="383.5" ></text>
+</g>
+<g >
+<title>__libc_realloc (2 samples, 0.10%; 0.00%)</title><rect x="1172.3" y="213" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1175.29" y="223.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::allocNoTrack(unsigned long, unsigned long) (4 samples, 0.20%; 0.00%)</title><rect x="965.1" y="341" width="2.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="968.10" y="351.5" ></text>
+</g>
+<g >
+<title>DB::Block::cloneWithColumns(std::__1::vector&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt; const&amp;) const (1 samples, 0.05%; 0.00%)</title><rect x="424.4" y="405" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="427.39" y="415.5" ></text>
+</g>
+<g >
+<title>extent_purge_forced_default.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="423.8" y="309" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.80" y="319.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (5 samples, 0.25%; 0.00%)</title><rect x="61.9" y="389" width="3.0" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="64.95" y="399.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1136.3" y="197" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1139.28" y="207.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::convertToBlockImplFinal&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;, false, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, std::__1::vector&lt;DB::IColumn*, std::__1::allocator&lt;DB::IColumn*&gt; &gt;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, DB::Arena*) const (760 samples, 38.02%; 0.00%)</title><rect x="427.9" y="357" width="448.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="430.93" y="367.5" >void DB::Aggregator::convertToBlockImplFinal&lt;DB::AggregationM..</text>
+</g>
+<g >
+<title>libunwind::DwarfInstructions&lt;libunwind::LocalAddressSpace, libunwind::Registers_x86_64&gt;::stepWithDwarf(libunwind::LocalAddressSpace&amp;, unsigned long, unsigned long, libunwind::Registers_x86_64&amp;) (4 samples, 0.20%; 0.00%)</title><rect x="62.5" y="325" width="2.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="65.54" y="335.5" ></text>
+</g>
+<g >
+<title>bool LZ4::(anonymous namespace)::decompressImpl&lt;8ul, true&gt;(char const*, char*, unsigned long, unsigned long) (.llvm.5035804696300559578) (2 samples, 0.10%; +0.10%)</title><rect x="1178.8" y="197" width="1.2" height="15.0" fill="rgb(255,203,203)" rx="2" ry="2" />
+<text  x="1181.78" y="207.5" ></text>
+</g>
+<g >
+<title>DB::IAggregateFunctionHelper&lt;DB::AggregateFunctionCount&gt;::insertResultIntoBatch(unsigned long, char**, unsigned long, DB::IColumn&amp;, DB::Arena*, bool) const (45 samples, 2.25%; +0.05%)</title><rect x="428.5" y="341" width="26.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="431.52" y="351.5" >D..</text>
+</g>
+<g >
+<title>memcpy (1 samples, 0.05%; 0.00%)</title><rect x="1134.5" y="197" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1137.51" y="207.5" ></text>
+</g>
+<g >
+<title>arena_decay_impl.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="423.8" y="373" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.80" y="383.5" ></text>
+</g>
+<g >
+<title>arena_maybe_decay.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="165" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="175.5" ></text>
+</g>
+<g >
+<title>DB::SourceWithProgress::work() (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="453" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="463.5" >DB::So..</text>
+</g>
+<g >
+<title>large_ralloc (2 samples, 0.10%; 0.00%)</title><rect x="1172.3" y="181" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1175.29" y="191.5" ></text>
+</g>
+<g >
+<title>DB::Aggregator::checkLimits(unsigned long, bool&amp;) const (5 samples, 0.25%; 0.00%)</title><rect x="61.9" y="405" width="3.0" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="64.95" y="415.5" ></text>
+</g>
+<g >
+<title>memcpy (1 samples, 0.05%; +0.05%)</title><rect x="314.0" y="245" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="317.00" y="255.5" ></text>
+</g>
+<g >
+<title>extent_try_coalesce_impl.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="1148.1" y="85" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1151.09" y="95.5" ></text>
+</g>
+<g >
+<title>memcpy (40 samples, 2.00%; -0.55%)</title><rect x="314.6" y="309" width="23.6" height="15.0" fill="rgb(176,176,255)" rx="2" ry="2" />
+<text  x="317.59" y="319.5" >m..</text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;1ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (2 samples, 0.10%; 0.00%)</title><rect x="1172.3" y="245" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1175.29" y="255.5" ></text>
+</g>
+<g >
+<title>extent_purge_lazy_default.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="1135.1" y="53" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="63.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Index::insertPositionsRange(DB::IColumn const&amp;, unsigned long, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1148.7" y="245" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1151.68" y="255.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (17 samples, 0.85%; -0.25%)</title><rect x="1138.6" y="213" width="10.1" height="15.0" fill="rgb(194,194,255)" rx="2" ry="2" />
+<text  x="1141.64" y="223.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (3 samples, 0.15%; 0.00%)</title><rect x="1187.6" y="197" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1190.64" y="207.5" ></text>
+</g>
+<g >
+<title>DB::ColumnString::index(DB::IColumn const&amp;, unsigned long) const (4 samples, 0.20%; 0.00%)</title><rect x="1169.3" y="261" width="2.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1172.34" y="271.5" ></text>
+</g>
+<g >
+<title>unw_backtrace (1 samples, 0.05%; 0.00%)</title><rect x="422.0" y="325" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.03" y="335.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;unsigned long&gt;::getPermutation(bool, unsigned long, int, DB::PODArray&lt;unsigned long, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;&amp;) const (2 samples, 0.10%; 0.00%)</title><rect x="425.0" y="389" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="427.98" y="399.5" ></text>
+</g>
+<g >
+<title>all (1,999 samples, 100%)</title><rect x="10.0" y="581" width="1180.0" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="13.00" y="591.5" ></text>
+</g>
+<g >
+<title>arena_decay (1 samples, 0.05%; 0.00%)</title><rect x="1135.1" y="133" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="143.5" ></text>
+</g>
+<g >
+<title>arena_decay_impl.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="1135.1" y="117" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="127.5" ></text>
+</g>
+<g >
+<title>DB::ExpressionTransform::transform(DB::Chunk&amp;) (1 samples, 0.05%; 0.00%)</title><rect x="424.4" y="421" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="427.39" y="431.5" ></text>
+</g>
+<g >
+<title>pread64 (1 samples, 0.05%; -0.25%)</title><rect x="1180.0" y="165" width="0.6" height="15.0" fill="rgb(194,194,255)" rx="2" ry="2" />
+<text  x="1182.96" y="175.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;char8_t&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;char8_t&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (3 samples, 0.15%; 0.00%)</title><rect x="1156.4" y="229" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1159.35" y="239.5" ></text>
+</g>
+<g >
+<title>arena_extent_alloc_large (1 samples, 0.05%; 0.00%)</title><rect x="1146.9" y="117" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1149.91" y="127.5" ></text>
+</g>
+<g >
+<title>DB::ISimpleTransform::work() (3 samples, 0.15%; 0.00%)</title><rect x="424.4" y="453" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="427.39" y="463.5" ></text>
+</g>
+<g >
+<title>munmap (3 samples, 0.15%; +0.05%)</title><rect x="426.2" y="325" width="1.7" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="429.16" y="335.5" ></text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (21 samples, 1.05%; 0.00%)</title><rect x="1156.4" y="245" width="12.3" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1159.35" y="255.5" ></text>
+</g>
+<g >
+<title>memcpy (1 samples, 0.05%; +0.05%)</title><rect x="1167.6" y="133" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1170.57" y="143.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (97 samples, 4.85%; +0.15%)</title><rect x="281.5" y="373" width="57.3" height="15.0" fill="rgb(255,200,200)" rx="2" ry="2" />
+<text  x="284.54" y="383.5" >Alloca..</text>
+</g>
+<g >
+<title>DB::PipelineExecutor::executeStepImpl(unsigned long, std::__1::atomic&lt;bool&gt;*) (1,913 samples, 95.70%; 0.00%)</title><rect x="60.2" y="485" width="1129.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="63.18" y="495.5" >DB::PipelineExecutor::executeStepImpl(unsigned long, std::__1::atomic&lt;bool&gt;*)</text>
+</g>
+<g >
+<title>extent_purge_lazy_impl.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="1135.1" y="69" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="79.5" ></text>
+</g>
+<g >
+<title>arena_maybe_decay.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="744.3" y="181" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="191.5" ></text>
+</g>
+<g >
+<title>libunwind::UnwindCursor&lt;libunwind::LocalAddressSpace, libunwind::Registers_x86_64&gt;::getInfoFromDwarfSection(unsigned long, libunwind::UnwindInfoSections const&amp;, unsigned int) (1 samples, 0.05%; 0.00%)</title><rect x="61.9" y="325" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="64.95" y="335.5" ></text>
+</g>
+<g >
+<title>CurrentMemoryTracker::free(long) (1 samples, 0.05%; 0.00%)</title><rect x="422.0" y="373" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.03" y="383.5" ></text>
+</g>
+<g >
+<title>DB::WriteBufferFromFileDescriptor::~WriteBufferFromFileDescriptor() (1 samples, 0.05%; +0.05%)</title><rect x="57.8" y="565" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="60.81" y="575.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::compactInplace() (12 samples, 0.60%; 0.00%)</title><rect x="1149.3" y="245" width="7.1" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1152.27" y="255.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeBaseSelectProcessor::generate() (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="405" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="415.5" >DB::Me..</text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Index::getSizeOfIndexType(DB::IColumn const&amp;, unsigned long) (1 samples, 0.05%; -0.05%)</title><rect x="33.0" y="565" width="0.6" height="15.0" fill="rgb(206,206,255)" rx="2" ry="2" />
+<text  x="36.02" y="575.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::free(void*, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="422.6" y="373" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.62" y="383.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeRangeReader::read(unsigned long, std::__1::deque&lt;DB::MarkRange, std::__1::allocator&lt;DB::MarkRange&gt; &gt;&amp;) (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="357" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="367.5" >DB::Me..</text>
+</g>
+<g >
+<title>__libc_realloc (3 samples, 0.15%; 0.00%)</title><rect x="967.5" y="341" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="970.46" y="351.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::executeImpl&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, DB::Arena*, unsigned long, std::__1::vector&lt;DB::IColumn const*, std::__1::allocator&lt;DB::IColumn const*&gt; &gt;&amp;, DB::Aggregator::AggregateFunctionInstruction*, bool, char*) const (552 samples, 27.61%; 0.00%)</title><rect x="96.2" y="405" width="325.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="99.18" y="415.5" >void DB::Aggregator::executeImpl&lt;DB::Aggrega..</text>
+</g>
+<g >
+<title>extent_try_coalesce_impl.llvm.8560445672181916695 (1 samples, 0.05%; +0.05%)</title><rect x="423.2" y="325" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="426.21" y="335.5" ></text>
+</g>
+<g >
+<title>bool LZ4::(anonymous namespace)::decompressImpl&lt;8ul, true&gt;(char const*, char*, unsigned long, unsigned long) (.llvm.5035804696300559578) (1 samples, 0.05%; 0.00%)</title><rect x="1181.7" y="181" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1184.74" y="191.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Index::getSizeOfIndexType(DB::IColumn const&amp;, unsigned long) (2 samples, 0.10%; -0.05%)</title><rect x="475.7" y="293" width="1.2" height="15.0" fill="rgb(206,206,255)" rx="2" ry="2" />
+<text  x="478.74" y="303.5" ></text>
+</g>
+<g >
+<title>unw_init_local (1 samples, 0.05%; 0.00%)</title><rect x="61.9" y="341" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="64.95" y="351.5" ></text>
+</g>
+<g >
+<title>libunwind::DwarfInstructions&lt;libunwind::LocalAddressSpace, libunwind::Registers_x86_64&gt;::stepWithDwarf(libunwind::LocalAddressSpace&amp;, unsigned long, unsigned long, libunwind::Registers_x86_64&amp;) (1 samples, 0.05%; 0.00%)</title><rect x="422.0" y="293" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.03" y="303.5" ></text>
+</g>
+<g >
+<title> (1,913 samples, 95.70%; 0.00%)</title><rect x="60.2" y="549" width="1129.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="63.18" y="559.5" ></text>
+</g>
+<g >
+<title>DB::IAggregateFunctionDataHelper&lt;DB::AggregateFunctionCountData, DB::AggregateFunctionCount&gt;::create(char*) const (1 samples, 0.05%; +0.05%)</title><rect x="421.4" y="357" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="424.44" y="367.5" ></text>
+</g>
+<g >
+<title>memcpy (1 samples, 0.05%; +0.05%)</title><rect x="1153.4" y="69" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1156.40" y="79.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;4ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::reserveForNextSize&lt;&gt;() (6 samples, 0.30%; 0.00%)</title><rect x="744.3" y="293" width="3.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="303.5" ></text>
+</g>
+<g >
+<title>syscall (3 samples, 0.15%; +0.15%)</title><rect x="63.1" y="309" width="1.8" height="15.0" fill="rgb(255,200,200)" rx="2" ry="2" />
+<text  x="66.13" y="319.5" ></text>
+</g>
+<g >
+<title>libunwind::UnwindCursor&lt;libunwind::LocalAddressSpace, libunwind::Registers_x86_64&gt;::getInfoFromDwarfSection(unsigned long, libunwind::UnwindInfoSections const&amp;, unsigned int) (1 samples, 0.05%; 0.00%)</title><rect x="427.9" y="229" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="430.93" y="239.5" ></text>
+</g>
+<g >
+<title>memcpy (1 samples, 0.05%; -0.05%)</title><rect x="1147.5" y="133" width="0.6" height="15.0" fill="rgb(206,206,255)" rx="2" ry="2" />
+<text  x="1150.50" y="143.5" ></text>
+</g>
+<g >
+<title>unw_backtrace (1 samples, 0.05%; 0.00%)</title><rect x="427.9" y="277" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="430.93" y="287.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1153.4" y="133" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1156.40" y="143.5" ></text>
+</g>
+<g >
+<title>libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::decodeFDE(libunwind::LocalAddressSpace&amp;, unsigned long, libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::FDE_Info*, libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::CIE_Info*) (1 samples, 0.05%; +0.05%)</title><rect x="427.9" y="213" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="430.93" y="223.5" ></text>
+</g>
+<g >
+<title>pread64 (3 samples, 0.15%; +0.15%)</title><rect x="1174.1" y="181" width="1.7" height="15.0" fill="rgb(255,200,200)" rx="2" ry="2" />
+<text  x="1177.06" y="191.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::selectIndexImpl&lt;DB::ColumnVector&lt;unsigned short&gt; &gt;(DB::ColumnVector&lt;unsigned short&gt; const&amp;, DB::IColumn const&amp;, unsigned long) (1 samples, 0.05%; +0.05%)</title><rect x="1168.7" y="229" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1171.75" y="239.5" ></text>
+</g>
+<g >
+<title>mmap64 (4 samples, 0.20%; -0.05%)</title><rect x="965.1" y="325" width="2.4" height="15.0" fill="rgb(206,206,255)" rx="2" ry="2" />
+<text  x="968.10" y="335.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::ColumnString::indexImpl&lt;unsigned short&gt;(DB::PODArray&lt;unsigned short, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt; const&amp;, unsigned long) const (51 samples, 2.55%; -0.20%)</title><rect x="66.1" y="357" width="30.1" height="15.0" fill="rgb(197,197,255)" rx="2" ry="2" />
+<text  x="69.08" y="367.5" >CO..</text>
+</g>
+<g >
+<title>DB::(anonymous namespace)::writeTraceInfo(DB::TraceType, int, siginfo_t*, void*) (33 samples, 1.65%; +0.30%)</title><rect x="10.0" y="549" width="19.5" height="15.0" fill="rgb(255,191,191)" rx="2" ry="2" />
+<text  x="13.00" y="559.5" ></text>
+</g>
+<g >
+<title>arena_extents_dirty_dalloc (1 samples, 0.05%; 0.00%)</title><rect x="423.2" y="357" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.21" y="367.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;unsigned int&gt;::insert(DB::Field const&amp;) (1 samples, 0.05%; 0.00%)</title><rect x="49.5" y="565" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="52.55" y="575.5" ></text>
+</g>
+<g >
+<title>DB::PODArrayBase&lt;2ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::byte_size(unsigned long) (1 samples, 0.05%; +0.05%)</title><rect x="51.9" y="565" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="54.91" y="575.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long)::\'lambda\'(unsigned long&amp;)::operator()(unsigned long&amp;) const (1 samples, 0.05%; +0.05%)</title><rect x="1159.3" y="213" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1162.30" y="223.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::allocNoTrack(unsigned long, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="245" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="255.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::free(long) (1 samples, 0.05%; 0.00%)</title><rect x="422.0" y="357" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.03" y="367.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;char8_t&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;char8_t&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long)::\'lambda\'(unsigned long&amp;)::operator()(unsigned long&amp;) const (1 samples, 0.05%; 0.00%)</title><rect x="1136.3" y="213" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1139.28" y="223.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::free(long) (1 samples, 0.05%; 0.00%)</title><rect x="422.0" y="341" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.03" y="351.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Dictionary::compact(COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;&amp;) (12 samples, 0.60%; 0.00%)</title><rect x="1149.3" y="229" width="7.1" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1152.27" y="239.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;signed char&gt;::serializeValueIntoArena(unsigned long, DB::Arena&amp;, char const*&amp;) const (5 samples, 0.25%; +0.15%)</title><rect x="46.6" y="565" width="2.9" height="15.0" fill="rgb(255,200,200)" rx="2" ry="2" />
+<text  x="49.60" y="575.5" ></text>
+</g>
+<g >
+<title>unw_step (4 samples, 0.20%; 0.00%)</title><rect x="62.5" y="341" width="2.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="65.54" y="351.5" ></text>
+</g>
+<g >
+<title>extent_heap_first (1 samples, 0.05%; +0.05%)</title><rect x="1135.7" y="101" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1138.69" y="111.5" ></text>
+</g>
+<g >
+<title>DB::ReadBufferFromFileDescriptor::nextImpl() (3 samples, 0.15%; 0.00%)</title><rect x="1174.1" y="197" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1177.06" y="207.5" ></text>
+</g>
+<g >
+<title>large_ralloc (1 samples, 0.05%; 0.00%)</title><rect x="1167.6" y="149" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1170.57" y="159.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeRangeReader::DelayedStream::finalize(std::__1::vector&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;) (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="325" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="335.5" >DB::Me..</text>
+</g>
+<g >
+<title>DB::SerializationNumber&lt;signed char&gt;::deserializeBinaryBulk(DB::IColumn&amp;, DB::ReadBuffer&amp;, unsigned long, double) const (2 samples, 0.10%; 0.00%)</title><rect x="1129.8" y="261" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="271.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (3 samples, 0.15%; 0.00%)</title><rect x="967.5" y="325" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="970.46" y="335.5" ></text>
+</g>
+<g >
+<title>arena_decay (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="197" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="207.5" ></text>
+</g>
+<g >
+<title>arena_decay_to_limit.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="423.8" y="341" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.80" y="351.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (5 samples, 0.25%; -0.20%)</title><rect x="1151.0" y="149" width="3.0" height="15.0" fill="rgb(197,197,255)" rx="2" ry="2" />
+<text  x="1154.04" y="159.5" ></text>
+</g>
+<g >
+<title>DB::ReadBufferFromFileDescriptor::nextImpl() (1 samples, 0.05%; 0.00%)</title><rect x="1175.8" y="213" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1178.83" y="223.5" ></text>
+</g>
+<g >
+<title>HashTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;::reinsert(HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;&amp;, unsigned long) (3 samples, 0.15%; +0.05%)</title><rect x="58.4" y="565" width="1.8" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="61.40" y="575.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (5 samples, 0.25%; 0.00%)</title><rect x="61.9" y="373" width="3.0" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="64.95" y="383.5" ></text>
+</g>
+<g >
+<title>DB::ISimpleTransform::prepare() (1 samples, 0.05%; +0.05%)</title><rect x="60.8" y="453" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="63.77" y="463.5" ></text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::~ColumnUnique() (2 samples, 0.10%; 0.00%)</title><rect x="422.0" y="405" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.03" y="415.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeRangeReader::startReadingChain(unsigned long, std::__1::deque&lt;DB::MarkRange, std::__1::allocator&lt;DB::MarkRange&gt; &gt;&amp;) (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="341" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="351.5" >DB::Me..</text>
+</g>
+<g >
+<title>libunwind::DwarfInstructions&lt;libunwind::LocalAddressSpace, libunwind::Registers_x86_64&gt;::stepWithDwarf(libunwind::LocalAddressSpace&amp;, unsigned long, unsigned long, libunwind::Registers_x86_64&amp;) (1 samples, 0.05%; 0.00%)</title><rect x="422.6" y="277" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.62" y="287.5" ></text>
+</g>
+<g >
+<title>DB::CompressedReadBufferFromFile::nextImpl() (10 samples, 0.50%; 0.00%)</title><rect x="1174.1" y="261" width="5.9" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1177.06" y="271.5" ></text>
+</g>
+<g >
+<title>DB::ReadBuffer::readStrict(char*, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1180.0" y="213" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1182.96" y="223.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (2 samples, 0.10%; 0.00%)</title><rect x="313.4" y="341" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="316.41" y="351.5" ></text>
+</g>
+<g >
+<title>__libc_realloc (3 samples, 0.15%; 0.00%)</title><rect x="1187.6" y="213" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1190.64" y="223.5" ></text>
+</g>
+<g >
+<title>malloc_default (1 samples, 0.05%; 0.00%)</title><rect x="1171.1" y="181" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1174.11" y="191.5" ></text>
+</g>
+<g >
+<title>large_dalloc (1 samples, 0.05%; 0.00%)</title><rect x="423.8" y="389" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.80" y="399.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::free(void*, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="427.9" y="341" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="430.93" y="351.5" ></text>
+</g>
+<g >
+<title>DB::CompressedReadBufferFromFile::readBig(char*, unsigned long) (2 samples, 0.10%; 0.00%)</title><rect x="1129.8" y="245" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="255.5" ></text>
+</g>
+<g >
+<title>arena_decay_impl.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="181" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="191.5" ></text>
+</g>
+<g >
+<title>DB::sortBlock(DB::Block&amp;, std::__1::vector&lt;DB::SortColumnDescription, std::__1::allocator&lt;DB::SortColumnDescription&gt; &gt; const&amp;, unsigned long) (2 samples, 0.10%; 0.00%)</title><rect x="425.0" y="405" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="427.98" y="415.5" ></text>
+</g>
+<g >
+<title>void DB::deserializeBinarySSE2&lt;1&gt;(DB::PODArray&lt;char8_t, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;&amp;, DB::PODArray&lt;unsigned long, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;&amp;, DB::ReadBuffer&amp;, unsigned long) (11 samples, 0.55%; 0.00%)</title><rect x="1182.9" y="261" width="6.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.92" y="271.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (3 samples, 0.15%; 0.00%)</title><rect x="1146.9" y="197" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1149.91" y="207.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::deserializeAndInsertFromArena(char const*) (468 samples, 23.41%; +0.05%)</title><rect x="471.6" y="325" width="276.3" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="474.61" y="335.5" >DB::ColumnLowCardinality::deserialize..</text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (21 samples, 1.05%; 0.00%)</title><rect x="1136.3" y="245" width="12.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1139.28" y="255.5" ></text>
+</g>
+<g >
+<title>memcpy (3 samples, 0.15%; 0.00%)</title><rect x="1187.6" y="165" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1190.64" y="175.5" ></text>
+</g>
+<g >
+<title>unw_backtrace (1 samples, 0.05%; 0.00%)</title><rect x="422.6" y="309" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.62" y="319.5" ></text>
+</g>
+<g >
+<title>tcache_bin_flush_large (1 samples, 0.05%; 0.00%)</title><rect x="1148.1" y="133" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1151.09" y="143.5" ></text>
+</g>
+<g >
+<title>DB::ColumnString::index(DB::IColumn const&amp;, unsigned long) const (3 samples, 0.15%; 0.00%)</title><rect x="1134.5" y="245" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1137.51" y="255.5" ></text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueDeserializeAndInsertFromArena(char const*, char const*&amp;) (4 samples, 0.20%; -0.05%)</title><rect x="477.5" y="309" width="2.4" height="15.0" fill="rgb(206,206,255)" rx="2" ry="2" />
+<text  x="480.51" y="319.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.05%; +0.05%)</title><rect x="424.4" y="373" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="427.39" y="383.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (4 samples, 0.20%; 0.00%)</title><rect x="740.2" y="245" width="2.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="743.20" y="255.5" ></text>
+</g>
+<g >
+<title>DB::ReadBufferFromFileDecorator::nextImpl() (3 samples, 0.15%; 0.00%)</title><rect x="1174.1" y="213" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1177.06" y="223.5" ></text>
+</g>
+<g >
+<title>extent_dalloc_wrapper (1 samples, 0.05%; 0.00%)</title><rect x="744.3" y="149" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="159.5" ></text>
+</g>
+<g >
+<title>extent_lock2 (1 samples, 0.05%; +0.05%)</title><rect x="1146.9" y="53" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1149.91" y="63.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;signed char&gt;::~ColumnVector() (1 samples, 0.05%; 0.00%)</title><rect x="423.8" y="421" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.80" y="431.5" ></text>
+</g>
+<g >
+<title>libunwind::UnwindCursor&lt;libunwind::LocalAddressSpace, libunwind::Registers_x86_64&gt;::setInfoBasedOnIPRegister(bool) (1 samples, 0.05%; 0.00%)</title><rect x="427.9" y="245" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="430.93" y="255.5" ></text>
+</g>
+<g >
+<title>__libc_realloc (1 samples, 0.05%; 0.00%)</title><rect x="1153.4" y="117" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1156.40" y="127.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::convertToBlockImpl&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, std::__1::vector&lt;DB::PODArray&lt;char*, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;*, std::__1::allocator&lt;DB::PODArray&lt;char*, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;*&gt; &gt;&amp;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, DB::Arena*, bool) const (763 samples, 38.17%; 0.00%)</title><rect x="426.2" y="373" width="450.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="429.16" y="383.5" >void DB::Aggregator::convertToBlockImpl&lt;DB::AggregationMethod..</text>
+</g>
+<g >
+<title>DB::CompressionCodecLZ4::doDecompressData(char const*, unsigned int, char*, unsigned int) const (3 samples, 0.15%; 0.00%)</title><rect x="1180.6" y="213" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1183.56" y="223.5" ></text>
+</g>
+<g >
+<title>__libc_realloc (4 samples, 0.20%; 0.00%)</title><rect x="740.2" y="261" width="2.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="743.20" y="271.5" ></text>
+</g>
+<g >
+<title>DB::ReadBuffer::readStrict(char*, unsigned long) (4 samples, 0.20%; 0.00%)</title><rect x="1180.0" y="261" width="2.3" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1182.96" y="271.5" ></text>
+</g>
+<g >
+<title>madvise (1 samples, 0.05%; +0.05%)</title><rect x="1135.1" y="37" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1138.10" y="47.5" ></text>
+</g>
+<g >
+<title>LZ4::decompress(char const*, char*, unsigned long, unsigned long, LZ4::PerformanceStatistics&amp;) (6 samples, 0.30%; 0.00%)</title><rect x="1176.4" y="213" width="3.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1179.42" y="223.5" ></text>
+</g>
+<g >
+<title>DB::ISource::tryGenerate() (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="421" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="431.5" >DB::IS..</text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::ColumnString::indexImpl&lt;char8_t&gt;(DB::PODArray&lt;char8_t, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt; const&amp;, unsigned long) const (2 samples, 0.10%; +0.05%)</title><rect x="64.9" y="357" width="1.2" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="67.90" y="367.5" ></text>
+</g>
+<g >
+<title>extent_purge_lazy_default.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="117" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="127.5" ></text>
+</g>
+<g >
+<title>void* std::__1::__thread_proxy&lt;std::__1::tuple&lt;std::__1::unique_ptr&lt;std::__1::__thread_struct, std::__1::default_delete&lt;std::__1::__thread_struct&gt; &gt;, void ThreadPoolImpl&lt;std::__1::thread&gt;::scheduleImpl&lt;void&gt;(std::__1::function&lt;void ()&gt;, int, std::__1::optional&lt;unsigned long&gt;)::\'lambda0\'()&gt; &gt;(void*) (1,913 samples, 95.70%; 0.00%)</title><rect x="60.2" y="533" width="1129.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="63.18" y="543.5" >void* std::__1::__thread_proxy&lt;std::__1::tuple&lt;std::__1::unique_ptr&lt;std::__1::__thread_struct, std::__1::default_delete&lt;std::__1::__thread_struct&gt; &gt;, void Th..</text>
+</g>
+<g >
+<title>__libc_free (1 samples, 0.05%; +0.05%)</title><rect x="1173.5" y="229" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1176.47" y="239.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (3 samples, 0.15%; 0.00%)</title><rect x="1187.6" y="229" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1190.64" y="239.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;8ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (2 samples, 0.10%; 0.00%)</title><rect x="1135.1" y="197" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="207.5" ></text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertData(char const*, unsigned long) (1 samples, 0.05%; +0.05%)</title><rect x="45.4" y="565" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="48.42" y="575.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::allocImpl(long, bool) (2 samples, 0.10%; 0.00%)</title><rect x="313.4" y="357" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="316.41" y="367.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeBaseSelectProcessor::readFromPart() (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="389" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="399.5" >DB::Me..</text>
+</g>
+<g >
+<title>large_ralloc (2 samples, 0.10%; 0.00%)</title><rect x="1165.8" y="149" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1168.80" y="159.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (2 samples, 0.10%; 0.00%)</title><rect x="1172.3" y="229" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1175.29" y="239.5" ></text>
+</g>
+<g >
+<title>DB::PartialSortingTransform::transform(DB::Chunk&amp;) (2 samples, 0.10%; 0.00%)</title><rect x="425.0" y="421" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="427.98" y="431.5" ></text>
+</g>
+<g >
+<title>DB::CompressedReadBufferBase::decompress(DB::BufferBase::Buffer&amp;, unsigned long, unsigned long) (1 samples, 0.05%; +0.05%)</title><rect x="50.1" y="565" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="53.14" y="575.5" ></text>
+</g>
+<g >
+<title>tcache_bin_flush_large (1 samples, 0.05%; +0.05%)</title><rect x="1171.1" y="149" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1174.11" y="159.5" ></text>
+</g>
+<g >
+<title>HashTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;::reinsert(HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;&amp;, unsigned long) (272 samples, 13.61%; -2.05%)</title><rect x="969.2" y="357" width="160.6" height="15.0" fill="rgb(83,83,255)" rx="2" ry="2" />
+<text  x="972.23" y="367.5" >HashTable&lt;StringRef,..</text>
+</g>
+<g >
+<title>memcpy (3 samples, 0.15%; -1.55%)</title><rect x="742.6" y="277" width="1.7" height="15.0" fill="rgb(114,114,255)" rx="2" ry="2" />
+<text  x="745.56" y="287.5" ></text>
+</g>
+<g >
+<title>CurrentMemoryTracker::free(long) (1 samples, 0.05%; 0.00%)</title><rect x="427.9" y="325" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="430.93" y="335.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (6 samples, 0.30%; 0.00%)</title><rect x="744.3" y="277" width="3.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="287.5" ></text>
+</g>
+<g >
+<title>unw_backtrace (5 samples, 0.25%; 0.00%)</title><rect x="61.9" y="357" width="3.0" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="64.95" y="367.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (2 samples, 0.10%; 0.00%)</title><rect x="1165.8" y="197" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1168.80" y="207.5" ></text>
+</g>
+<g >
+<title>std::__1::vector&lt;DB::ColumnWithTypeAndName, std::__1::allocator&lt;DB::ColumnWithTypeAndName&gt; &gt;::reserve(unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="424.4" y="389" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="427.39" y="399.5" ></text>
+</g>
+<g >
+<title>large_ralloc (1 samples, 0.05%; 0.00%)</title><rect x="1153.4" y="85" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1156.40" y="95.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;1ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (3 samples, 0.15%; 0.00%)</title><rect x="1187.6" y="245" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1190.64" y="255.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::executeImplBatch&lt;false, false, DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt; &gt;(DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;::State&amp;, DB::Arena*, unsigned long, DB::Aggregator::AggregateFunctionInstruction*, char*) const (552 samples, 27.61%; -0.15%)</title><rect x="96.2" y="389" width="325.8" height="15.0" fill="rgb(200,200,255)" rx="2" ry="2" />
+<text  x="99.18" y="399.5" >void DB::Aggregator::executeImplBatch&lt;false,..</text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;unsigned short&gt;::index(DB::IColumn const&amp;, unsigned long) const (1 samples, 0.05%; 0.00%)</title><rect x="1168.7" y="245" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1171.75" y="255.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;unsigned int&gt;::insert(DB::Field const&amp;) (6 samples, 0.30%; -0.25%)</title><rect x="744.3" y="309" width="3.6" height="15.0" fill="rgb(194,194,255)" rx="2" ry="2" />
+<text  x="747.33" y="319.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Index::checkSizeOfType() (3 samples, 0.15%; +0.05%)</title><rect x="29.5" y="565" width="1.8" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="32.48" y="575.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (6 samples, 0.30%; 0.00%)</title><rect x="744.3" y="245" width="3.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="255.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::selectIndexImpl&lt;DB::ColumnVector&lt;unsigned short&gt; &gt;(DB::ColumnVector&lt;unsigned short&gt; const&amp;, DB::IColumn const&amp;, unsigned long) (2 samples, 0.10%; +0.10%)</title><rect x="1155.2" y="197" width="1.2" height="15.0" fill="rgb(255,203,203)" rx="2" ry="2" />
+<text  x="1158.17" y="207.5" ></text>
+</g>
+<g >
+<title>DB::ExecutionThreadContext::executeTask() (1,911 samples, 95.60%; -0.05%)</title><rect x="61.4" y="469" width="1128.0" height="15.0" fill="rgb(206,206,255)" rx="2" ry="2" />
+<text  x="64.36" y="479.5" >DB::ExecutionThreadContext::executeTask()</text>
+</g>
+<g >
+<title>void miniselect::floyd_rivest_detail::floyd_rivest_select_loop&lt;unsigned long*, DB::ColumnVector&lt;unsigned long&gt;::greater&amp;, long&gt;(unsigned long*, long, long, long, DB::ColumnVector&lt;unsigned long&gt;::greater&amp;) (2 samples, 0.10%; +0.05%)</title><rect x="425.0" y="373" width="1.2" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="427.98" y="383.5" ></text>
+</g>
+<g >
+<title>__clone (1,913 samples, 95.70%; 0.00%)</title><rect x="60.2" y="565" width="1129.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="63.18" y="575.5" >__clone</text>
+</g>
+<g >
+<title>DB::AggregatingTransform::work() (614 samples, 30.72%; 0.00%)</title><rect x="61.9" y="453" width="362.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="64.95" y="463.5" >DB::AggregatingTransform::work()</text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (2 samples, 0.10%; +0.05%)</title><rect x="1156.9" y="181" width="1.2" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1159.94" y="191.5" ></text>
+</g>
+<g >
+<title>arena_decay_to_limit.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="744.3" y="165" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="175.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;unsigned short&gt;::~ColumnVector() (1 samples, 0.05%; 0.00%)</title><rect x="423.2" y="405" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.21" y="415.5" ></text>
+</g>
+<g >
+<title>DB::ReadBuffer::readStrict(char*, unsigned long) (3 samples, 0.15%; 0.00%)</title><rect x="1174.1" y="229" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1177.06" y="239.5" ></text>
+</g>
+<g >
+<title>DB::ISource::work() (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="437" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="447.5" >DB::IS..</text>
+</g>
+<g >
+<title>unw_step (1 samples, 0.05%; 0.00%)</title><rect x="427.9" y="261" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="430.93" y="271.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (11 samples, 0.55%; 0.00%)</title><rect x="726.6" y="245" width="6.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="729.62" y="255.5" ></text>
+</g>
+<g >
+<title> (33 samples, 1.65%; 0.00%)</title><rect x="10.0" y="565" width="19.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="13.00" y="575.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;signed char&gt;::serializeValueIntoArena(unsigned long, DB::Arena&amp;, char const*&amp;) const (9 samples, 0.45%; +0.15%)</title><rect x="387.8" y="373" width="5.3" height="15.0" fill="rgb(255,200,200)" rx="2" ry="2" />
+<text  x="390.79" y="383.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (18 samples, 0.90%; +0.05%)</title><rect x="1158.1" y="229" width="10.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1161.12" y="239.5" ></text>
+</g>
+<g >
+<title>large_palloc (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="213" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="223.5" ></text>
+</g>
+<g >
+<title>void DB::Aggregator::mergeDataImpl&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;, false, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt; &gt;(HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, HashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;&amp;, DB::Arena*) const (429 samples, 21.46%; +0.55%)</title><rect x="876.6" y="389" width="253.2" height="15.0" fill="rgb(255,176,176)" rx="2" ry="2" />
+<text  x="879.55" y="399.5" >void DB::Aggregator::mergeDataImp..</text>
+</g>
+<g >
+<title>DB::ColumnString::insertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (3 samples, 0.15%; +0.05%)</title><rect x="1171.7" y="261" width="1.8" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1174.70" y="271.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (20 samples, 1.00%; +0.10%)</title><rect x="1136.9" y="229" width="11.8" height="15.0" fill="rgb(255,203,203)" rx="2" ry="2" />
+<text  x="1139.87" y="239.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (1 samples, 0.05%; 0.00%)</title><rect x="1153.4" y="101" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1156.40" y="111.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::deserializeAndInsertFromArena(char const*) (2 samples, 0.10%; +0.05%)</title><rect x="33.6" y="565" width="1.2" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="36.61" y="575.5" ></text>
+</g>
+<g >
+<title>memcpy (1 samples, 0.05%; +0.05%)</title><rect x="1168.2" y="197" width="0.5" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1171.16" y="207.5" ></text>
+</g>
+<g >
+<title>large_ralloc (40 samples, 2.00%; 0.00%)</title><rect x="314.6" y="325" width="23.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="317.59" y="335.5" >l..</text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long)::\'lambda\'(unsigned long&amp;)::operator()(unsigned long&amp;) const (1 samples, 0.05%; +0.05%)</title><rect x="1138.1" y="213" width="0.5" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1141.05" y="223.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;unsigned short&gt;::index(DB::IColumn const&amp;, unsigned long) const (2 samples, 0.10%; 0.00%)</title><rect x="1155.2" y="213" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1158.17" y="223.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::selectIndexImpl&lt;DB::ColumnString&gt;(DB::ColumnString const&amp;, DB::IColumn const&amp;, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1150.5" y="197" width="0.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1153.45" y="207.5" ></text>
+</g>
+<g >
+<title>madvise (1 samples, 0.05%; +0.05%)</title><rect x="423.8" y="293" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="426.80" y="303.5" ></text>
+</g>
+<g >
+<title>ThreadPoolImpl&lt;std::__1::thread&gt;::worker(std::__1::__list_iterator&lt;std::__1::thread, void*&gt;) (1,913 samples, 95.70%; 0.00%)</title><rect x="60.2" y="517" width="1129.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="63.18" y="527.5" >ThreadPoolImpl&lt;std::__1::thread&gt;::worker(std::__1::__list_iterator&lt;std::__1::thread, void*&gt;)</text>
+</g>
+<g >
+<title>DB::ColumnString::~ColumnString() (1 samples, 0.05%; 0.00%)</title><rect x="422.6" y="389" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.62" y="399.5" ></text>
+</g>
+<g >
+<title>extent_record.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="1148.1" y="101" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1151.09" y="111.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::selectIndexImpl&lt;DB::ColumnString&gt;(DB::ColumnString const&amp;, DB::IColumn const&amp;, unsigned long) (53 samples, 2.65%; 0.00%)</title><rect x="64.9" y="373" width="31.3" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="67.90" y="383.5" >CO..</text>
+</g>
+<g >
+<title>madvise (1 samples, 0.05%; +0.05%)</title><rect x="1182.3" y="101" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1185.33" y="111.5" ></text>
+</g>
+<g >
+<title>memcpy (11 samples, 0.55%; +0.20%)</title><rect x="726.6" y="213" width="6.5" height="15.0" fill="rgb(255,197,197)" rx="2" ry="2" />
+<text  x="729.62" y="223.5" ></text>
+</g>
+<g >
+<title>extent_purge_forced_default.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="744.3" y="133" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="143.5" ></text>
+</g>
+<g >
+<title>extent_lock_from_addr (1 samples, 0.05%; +0.05%)</title><rect x="1148.1" y="69" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1151.09" y="79.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (2 samples, 0.10%; 0.00%)</title><rect x="1172.3" y="197" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1175.29" y="207.5" ></text>
+</g>
+<g >
+<title>unw_step (2 samples, 0.10%; 0.00%)</title><rect x="313.4" y="309" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="316.41" y="319.5" ></text>
+</g>
+<g >
+<title>DB::ISource::work() (1,192 samples, 59.63%; 0.00%)</title><rect x="426.2" y="453" width="703.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="429.16" y="463.5" >DB::ISource::work()</text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::insertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (26 samples, 1.30%; 0.00%)</title><rect x="1133.3" y="261" width="15.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1136.33" y="271.5" ></text>
+</g>
+<g >
+<title>extent_split_impl.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="1146.9" y="69" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1149.91" y="79.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::selectIndexImpl&lt;DB::ColumnString&gt;(DB::ColumnString const&amp;, DB::IColumn const&amp;, unsigned long) (3 samples, 0.15%; 0.00%)</title><rect x="1134.5" y="229" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1137.51" y="239.5" ></text>
+</g>
+<g >
+<title>DB::Field::~Field() (2 samples, 0.10%; +0.05%)</title><rect x="50.7" y="565" width="1.2" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="53.73" y="575.5" ></text>
+</g>
+<g >
+<title>memcpy (2 samples, 0.10%; 0.00%)</title><rect x="1165.8" y="133" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1168.80" y="143.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::free(long) (1 samples, 0.05%; 0.00%)</title><rect x="427.9" y="293" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="430.93" y="303.5" ></text>
+</g>
+<g >
+<title>DB::ReadBufferFromFileDecorator::nextImpl() (1 samples, 0.05%; 0.00%)</title><rect x="1180.0" y="197" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1182.96" y="207.5" ></text>
+</g>
+<g >
+<title>DB::ISerialization::deserializeBinaryBulkWithMultipleStreams(COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;&amp;, unsigned long, DB::ISerialization::DeserializeBinaryBulkSettings&amp;, std::__1::shared_ptr&lt;DB::ISerialization::DeserializeBinaryBulkState&gt;&amp;, std::__1::unordered_map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::hash&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::equal_to&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt; &gt;*) const (2 samples, 0.10%; 0.00%)</title><rect x="1129.8" y="277" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="287.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;char8_t&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;char8_t&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long)::\'lambda\'(unsigned long&amp;)::operator()(unsigned long&amp;) const (3 samples, 0.15%; +0.05%)</title><rect x="1156.4" y="213" width="1.7" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1159.35" y="223.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::freeNoTrack(void*, unsigned long) (3 samples, 0.15%; 0.00%)</title><rect x="426.2" y="341" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="429.16" y="351.5" ></text>
+</g>
+<g >
+<title>arena_decay_to_limit.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="1135.1" y="85" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="95.5" ></text>
+</g>
+<g >
+<title>large_ralloc (3 samples, 0.15%; 0.00%)</title><rect x="1187.6" y="181" width="1.8" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1190.64" y="191.5" ></text>
+</g>
+<g >
+<title>DB::Block DB::Aggregator::prepareBlockAndFill&lt;DB::Block DB::Aggregator::convertOneBucketToBlock&lt;DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt; &gt;(DB::AggregatedDataVariants&amp;, DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;, DB::Arena*, bool, unsigned long) const::\'lambda\'(std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, std::__1::vector&lt;DB::PODArray&lt;char*, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;*, std::__1::allocator&lt;DB::PODArray&lt;char*, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;*&gt; &gt;&amp;, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;, bool)&gt;(DB::AggregatedDataVariants&amp;, bool, unsigned long, DB::AggregationMethodSerialized&lt;TwoLevelHashMapTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt;, HashMapTable&gt; &gt;&amp;&amp;) const (763 samples, 38.17%; 0.00%)</title><rect x="426.2" y="389" width="450.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="429.16" y="399.5" >DB::Block DB::Aggregator::prepareBlockAndFill&lt;DB::Block DB::A..</text>
+</g>
+<g >
+<title>memcpy (4 samples, 0.20%; +0.10%)</title><rect x="740.2" y="213" width="2.4" height="15.0" fill="rgb(255,203,203)" rx="2" ry="2" />
+<text  x="743.20" y="223.5" ></text>
+</g>
+<g >
+<title>memcpy (5 samples, 0.25%; +0.10%)</title><rect x="744.9" y="213" width="3.0" height="15.0" fill="rgb(255,203,203)" rx="2" ry="2" />
+<text  x="747.92" y="223.5" ></text>
+</g>
+<g >
+<title>DB::ICompressionCodec::decompress(char const*, unsigned int, char*) const (6 samples, 0.30%; 0.00%)</title><rect x="1176.4" y="245" width="3.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1179.42" y="255.5" ></text>
+</g>
+<g >
+<title>DB::ColumnString::serializeValueIntoArena(unsigned long, DB::Arena&amp;, char const*&amp;) const (18 samples, 0.90%; +0.30%)</title><rect x="34.8" y="565" width="10.6" height="15.0" fill="rgb(255,191,191)" rx="2" ry="2" />
+<text  x="37.79" y="575.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (9 samples, 0.45%; +0.15%)</title><rect x="52.5" y="565" width="5.3" height="15.0" fill="rgb(255,200,200)" rx="2" ry="2" />
+<text  x="55.50" y="575.5" ></text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeFrom(DB::IColumn const&amp;, unsigned long, unsigned long) (7 samples, 0.35%; 0.00%)</title><rect x="1151.0" y="213" width="4.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1154.04" y="223.5" ></text>
+</g>
+<g >
+<title>madvise (1 samples, 0.05%; +0.05%)</title><rect x="744.3" y="117" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="747.33" y="127.5" ></text>
+</g>
+<g >
+<title>memcpy (36 samples, 1.80%; -0.40%)</title><rect x="366.5" y="357" width="21.3" height="15.0" fill="rgb(185,185,255)" rx="2" ry="2" />
+<text  x="369.54" y="367.5" >m..</text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (2 samples, 0.10%; 0.00%)</title><rect x="1156.9" y="197" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1159.94" y="207.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (41 samples, 2.05%; 0.00%)</title><rect x="314.6" y="341" width="24.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="317.59" y="351.5" >a..</text>
+</g>
+<g >
+<title>DB::ReadBufferFromFileDecorator::nextImpl() (1 samples, 0.05%; 0.00%)</title><rect x="1175.8" y="229" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1178.83" y="239.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (1 samples, 0.05%; -0.05%)</title><rect x="1136.3" y="181" width="0.6" height="15.0" fill="rgb(206,206,255)" rx="2" ry="2" />
+<text  x="1139.28" y="191.5" ></text>
+</g>
+<g >
+<title>arena_maybe_decay.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="423.8" y="357" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.80" y="367.5" ></text>
+</g>
+<g >
+<title>libunwind::UnwindCursor&lt;libunwind::LocalAddressSpace, libunwind::Registers_x86_64&gt;::setInfoBasedOnIPRegister(bool) (2 samples, 0.10%; 0.00%)</title><rect x="313.4" y="293" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="316.41" y="303.5" ></text>
+</g>
+<g >
+<title>libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::parseInstructions(libunwind::LocalAddressSpace&amp;, unsigned long, unsigned long, libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::CIE_Info const&amp;, unsigned long, libunwind::PrologInfoStackEntry*&amp;, int, libunwind::PrologInfo*, libunwind::StackGuard&amp;) (2 samples, 0.10%; +0.05%)</title><rect x="313.4" y="261" width="1.2" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="316.41" y="271.5" ></text>
+</g>
+<g >
+<title>HashTable&lt;StringRef, HashMapCellWithSavedHash&lt;StringRef, char*, DefaultHash&lt;StringRef&gt;, HashTableNoState&gt;, DefaultHash&lt;StringRef&gt;, TwoLevelHashTableGrower&lt;8ul&gt;, Allocator&lt;true, true&gt; &gt;::resize(unsigned long, unsigned long) (300 samples, 15.01%; -0.70%)</title><rect x="952.7" y="373" width="177.1" height="15.0" fill="rgb(166,166,255)" rx="2" ry="2" />
+<text  x="955.70" y="383.5" >HashTable&lt;StringRef, Ha..</text>
+</g>
+<g >
+<title>DB::ReadBufferFromFileDescriptor::nextImpl() (1 samples, 0.05%; 0.00%)</title><rect x="1180.0" y="181" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1182.96" y="191.5" ></text>
+</g>
+<g >
+<title>extent_dalloc_wrapper (1 samples, 0.05%; 0.00%)</title><rect x="423.8" y="325" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.80" y="335.5" ></text>
+</g>
+<g >
+<title>large_palloc (2 samples, 0.10%; 0.00%)</title><rect x="1135.1" y="149" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="159.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeReaderWide::readRows(unsigned long, unsigned long, bool, unsigned long, std::__1::vector&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt;&amp;) (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="309" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="319.5" >DB::Me..</text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::allocNoTrack(unsigned long, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1171.1" y="197" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1174.11" y="207.5" ></text>
+</g>
+<g >
+<title>DB::ISource::tryGenerate() (1,192 samples, 59.63%; 0.00%)</title><rect x="426.2" y="437" width="703.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="429.16" y="447.5" >DB::ISource::tryGenerate()</text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::selectIndexImpl&lt;DB::ColumnString&gt;(DB::ColumnString const&amp;, DB::IColumn const&amp;, unsigned long) (4 samples, 0.20%; 0.00%)</title><rect x="1169.3" y="245" width="2.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1172.34" y="255.5" ></text>
+</g>
+<g >
+<title>DB::SerializationString::deserializeBinaryBulk(DB::IColumn&amp;, DB::ReadBuffer&amp;, unsigned long, double) const (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="261" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="271.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;char8_t&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;char8_t&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long)::\'lambda\'(unsigned long&amp;)::operator()(unsigned long&amp;) const (5 samples, 0.25%; 0.00%)</title><rect x="1151.0" y="181" width="3.0" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1154.04" y="191.5" ></text>
+</g>
+<g >
+<title>DB::CompressedReadBufferBase::readCompressedData(unsigned long&amp;, unsigned long&amp;, bool) (1 samples, 0.05%; 0.00%)</title><rect x="1180.0" y="229" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1182.96" y="239.5" ></text>
+</g>
+<g >
+<title>memcpy (1 samples, 0.05%; 0.00%)</title><rect x="65.5" y="341" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="68.49" y="351.5" ></text>
+</g>
+<g >
+<title>large_ralloc (3 samples, 0.15%; 0.00%)</title><rect x="967.5" y="309" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="970.46" y="319.5" ></text>
+</g>
+<g >
+<title>DB::CompressedReadBufferBase::readCompressedData(unsigned long&amp;, unsigned long&amp;, bool) (4 samples, 0.20%; 0.00%)</title><rect x="1174.1" y="245" width="2.3" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1177.06" y="255.5" ></text>
+</g>
+<g >
+<title>large_dalloc_prep_impl.llvm.1961183231332244401 (1 samples, 0.05%; +0.05%)</title><rect x="419.7" y="357" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="422.66" y="367.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; DB::ColumnString::indexImpl&lt;unsigned short&gt;(DB::PODArray&lt;unsigned short, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt; const&amp;, unsigned long) const (3 samples, 0.15%; -0.05%)</title><rect x="1134.5" y="213" width="1.8" height="15.0" fill="rgb(206,206,255)" rx="2" ry="2" />
+<text  x="1137.51" y="223.5" ></text>
+</g>
+<g >
+<title>arena_ralloc (1 samples, 0.05%; 0.00%)</title><rect x="1167.6" y="165" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1170.57" y="175.5" ></text>
+</g>
+<g >
+<title>arena_extent_alloc_large (1 samples, 0.05%; 0.00%)</title><rect x="1135.7" y="133" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.69" y="143.5" ></text>
+</g>
+<g >
+<title>large_palloc (1 samples, 0.05%; 0.00%)</title><rect x="1146.9" y="133" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1149.91" y="143.5" ></text>
+</g>
+<g >
+<title>DB::MergeTreeBaseSelectProcessor::readFromPartImpl() (101 samples, 5.05%; 0.00%)</title><rect x="1129.8" y="373" width="59.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1132.79" y="383.5" >DB::Me..</text>
+</g>
+<g >
+<title>void std::__1::__function::__policy_invoker&lt;void ()&gt;::__call_impl&lt;std::__1::__function::__default_alloc_func&lt;ThreadFromGlobalPool::ThreadFromGlobalPool&lt;DB::PipelineExecutor::executeImpl(unsigned long)::$_1&gt;(DB::PipelineExecutor::executeImpl(unsigned long)::$_1&amp;&amp;)::\'lambda\'(), void ()&gt; &gt;(std::__1::__function::__policy_storage const*) (1,913 samples, 95.70%; 0.00%)</title><rect x="60.2" y="501" width="1129.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="63.18" y="511.5" >void std::__1::__function::__policy_invoker&lt;void ()&gt;::__call_impl&lt;std::__1::__function::__default_alloc_func&lt;ThreadFromGlobalPool::ThreadFromGlobalPool&lt;DB::P..</text>
+</g>
+<g >
+<title>DB::ColumnString::index(DB::IColumn const&amp;, unsigned long) const (53 samples, 2.65%; 0.00%)</title><rect x="64.9" y="389" width="31.3" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="67.90" y="399.5" >DB..</text>
+</g>
+<g >
+<title>DB::Aggregator::mergeAndConvertOneBucketToBlock(std::__1::vector&lt;std::__1::shared_ptr&lt;DB::AggregatedDataVariants&gt;, std::__1::allocator&lt;std::__1::shared_ptr&lt;DB::AggregatedDataVariants&gt; &gt; &gt;&amp;, DB::Arena*, bool, unsigned long, std::__1::atomic&lt;bool&gt;*) const (1,192 samples, 59.63%; 0.00%)</title><rect x="426.2" y="405" width="703.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="429.16" y="415.5" >DB::Aggregator::mergeAndConvertOneBucketToBlock(std::__1::vector&lt;std::__1::shared_ptr&lt;DB::Aggrega..</text>
+</g>
+<g >
+<title>memcpy (3 samples, 0.15%; 0.00%)</title><rect x="967.5" y="293" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="970.46" y="303.5" ></text>
+</g>
+<g >
+<title>DB::ColumnString::~ColumnString() (1 samples, 0.05%; 0.00%)</title><rect x="1173.5" y="261" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1176.47" y="271.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::free(void*, unsigned long) (3 samples, 0.15%; 0.00%)</title><rect x="426.2" y="357" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="429.16" y="367.5" ></text>
+</g>
+<g >
+<title>DB::ConvertingAggregatedToChunksSource::generate() (1,192 samples, 59.63%; 0.00%)</title><rect x="426.2" y="421" width="703.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="429.16" y="431.5" >DB::ConvertingAggregatedToChunksSource::generate()</text>
+</g>
+<g >
+<title>extent_record.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="423.2" y="341" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.21" y="351.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::free(void*, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1173.5" y="245" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1176.47" y="255.5" ></text>
+</g>
+<g >
+<title>extent_purge_lazy_impl.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="133" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="143.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::free(void*, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="423.2" y="389" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.21" y="399.5" ></text>
+</g>
+<g >
+<title>void DB::PODArrayBase&lt;1ul, 4096ul, Allocator&lt;false, false&gt;, 15ul, 16ul&gt;::resize&lt;&gt;(unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1171.1" y="213" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1174.11" y="223.5" ></text>
+</g>
+<g >
+<title>malloc_default (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="229" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="239.5" ></text>
+</g>
+<g >
+<title>memcpy (22 samples, 1.10%; +0.45%)</title><rect x="83.2" y="341" width="13.0" height="15.0" fill="rgb(255,182,182)" rx="2" ry="2" />
+<text  x="86.20" y="351.5" ></text>
+</g>
+<g >
+<title>memcpy (2 samples, 0.10%; +0.05%)</title><rect x="1129.8" y="229" width="1.2" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1132.79" y="239.5" ></text>
+</g>
+<g >
+<title>DB::(anonymous namespace)::mapUniqueIndex(DB::IColumn&amp;) (2 samples, 0.10%; +0.05%)</title><rect x="1149.3" y="213" width="1.2" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1152.27" y="223.5" ></text>
+</g>
+<g >
+<title>large_dalloc (1 samples, 0.05%; 0.00%)</title><rect x="423.2" y="373" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.21" y="383.5" ></text>
+</g>
+<g >
+<title>unw_step (1 samples, 0.05%; 0.00%)</title><rect x="422.6" y="293" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.62" y="303.5" ></text>
+</g>
+<g >
+<title>__libc_realloc (2 samples, 0.10%; 0.00%)</title><rect x="1165.8" y="181" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1168.80" y="191.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::free(void*, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="422.0" y="389" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.03" y="399.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;char8_t&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;char8_t&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (7 samples, 0.35%; 0.00%)</title><rect x="1151.0" y="197" width="4.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1154.04" y="207.5" ></text>
+</g>
+<g >
+<title>MemoryTracker::free(long) (1 samples, 0.05%; 0.00%)</title><rect x="422.6" y="325" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.62" y="335.5" ></text>
+</g>
+<g >
+<title>DB::ExecutingGraph::updateNode(unsigned long, std::__1::queue&lt;DB::ExecutingGraph::Node*, std::__1::deque&lt;DB::ExecutingGraph::Node*, std::__1::allocator&lt;DB::ExecutingGraph::Node*&gt; &gt; &gt;&amp;, std::__1::queue&lt;DB::ExecutingGraph::Node*, std::__1::deque&lt;DB::ExecutingGraph::Node*, std::__1::allocator&lt;DB::ExecutingGraph::Node*&gt; &gt; &gt;&amp;) (2 samples, 0.10%; +0.05%)</title><rect x="60.2" y="469" width="1.2" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="63.18" y="479.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (10 samples, 0.50%; -0.20%)</title><rect x="963.3" y="357" width="5.9" height="15.0" fill="rgb(197,197,255)" rx="2" ry="2" />
+<text  x="966.33" y="367.5" ></text>
+</g>
+<g >
+<title>DB::(anonymous namespace)::mapUniqueIndex(DB::IColumn&amp;) (2 samples, 0.10%; -0.15%)</title><rect x="1133.3" y="245" width="1.2" height="15.0" fill="rgb(200,200,255)" rx="2" ry="2" />
+<text  x="1136.33" y="255.5" ></text>
+</g>
+<g >
+<title>memcpy (2 samples, 0.10%; +0.10%)</title><rect x="1172.3" y="165" width="1.2" height="15.0" fill="rgb(255,203,203)" rx="2" ry="2" />
+<text  x="1175.29" y="175.5" ></text>
+</g>
+<g >
+<title>extent_recycle.llvm.8560445672181916695 (1 samples, 0.05%; 0.00%)</title><rect x="1135.7" y="117" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.69" y="127.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Index::getMaxPositionForCurrentType() const (1 samples, 0.05%; 0.00%)</title><rect x="476.9" y="309" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="479.92" y="319.5" ></text>
+</g>
+<g >
+<title>__libc_realloc (6 samples, 0.30%; 0.00%)</title><rect x="744.3" y="261" width="3.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="271.5" ></text>
+</g>
+<g >
+<title>arena_extents_dirty_dalloc (1 samples, 0.05%; 0.00%)</title><rect x="1148.1" y="117" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1151.09" y="127.5" ></text>
+</g>
+<g >
+<title>memcpy (1 samples, 0.05%; +0.05%)</title><rect x="338.2" y="325" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="341.20" y="335.5" ></text>
+</g>
+<g >
+<title>DB::Aggregator::executeOnBlock(std::__1::vector&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::allocator&lt;COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt;, unsigned long, DB::AggregatedDataVariants&amp;, std::__1::vector&lt;DB::IColumn const*, std::__1::allocator&lt;DB::IColumn const*&gt; &gt;&amp;, std::__1::vector&lt;std::__1::vector&lt;DB::IColumn const*, std::__1::allocator&lt;DB::IColumn const*&gt; &gt;, std::__1::allocator&lt;std::__1::vector&lt;DB::IColumn const*, std::__1::allocator&lt;DB::IColumn const*&gt; &gt; &gt; &gt;&amp;, bool&amp;) const (610 samples, 30.52%; 0.00%)</title><rect x="61.9" y="421" width="360.1" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="64.95" y="431.5" >DB::Aggregator::executeOnBlock(std::__1::vector&lt;..</text>
+</g>
+<g >
+<title>DB::SerializationLowCardinality::deserializeBinaryBulkWithMultipleStreams(COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;&amp;, unsigned long, DB::ISerialization::DeserializeBinaryBulkSettings&amp;, std::__1::shared_ptr&lt;DB::ISerialization::DeserializeBinaryBulkState&gt;&amp;, std::__1::unordered_map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt;, std::__1::hash&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::equal_to&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, COW&lt;DB::IColumn&gt;::immutable_ptr&lt;DB::IColumn&gt; &gt; &gt; &gt;*) const (99 samples, 4.95%; +0.05%)</title><rect x="1131.0" y="277" width="58.4" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1133.97" y="287.5" >DB::Se..</text>
+</g>
+<g >
+<title>tcache_event_hard (1 samples, 0.05%; 0.00%)</title><rect x="1171.1" y="165" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1174.11" y="175.5" ></text>
+</g>
+<g >
+<title>LZ4::decompress(char const*, char*, unsigned long, unsigned long, LZ4::PerformanceStatistics&amp;) (3 samples, 0.15%; 0.00%)</title><rect x="1180.6" y="197" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1183.56" y="207.5" ></text>
+</g>
+<g >
+<title>arena_decay_to_limit.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="1182.3" y="149" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1185.33" y="159.5" ></text>
+</g>
+<g >
+<title>DB::ICompressionCodec::decompress(char const*, unsigned int, char*) const (3 samples, 0.15%; 0.00%)</title><rect x="1180.6" y="229" width="1.7" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1183.56" y="239.5" ></text>
+</g>
+<g >
+<title>DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertData(char const*, unsigned long) (448 samples, 22.41%; 0.00%)</title><rect x="479.9" y="309" width="264.4" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="482.87" y="319.5" >DB::ColumnUnique&lt;DB::ColumnString&gt;:..</text>
+</g>
+<g >
+<title>CurrentMemoryTracker::free(long) (1 samples, 0.05%; 0.00%)</title><rect x="422.6" y="357" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.62" y="367.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;unsigned short&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;unsigned short&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (5 samples, 0.25%; 0.00%)</title><rect x="1151.0" y="165" width="3.0" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1154.04" y="175.5" ></text>
+</g>
+<g >
+<title>unw_backtrace (2 samples, 0.10%; 0.00%)</title><rect x="313.4" y="325" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="316.41" y="335.5" ></text>
+</g>
+<g >
+<title>memcpy (6 samples, 0.30%; +0.10%)</title><rect x="733.1" y="261" width="3.6" height="15.0" fill="rgb(255,203,203)" rx="2" ry="2" />
+<text  x="736.11" y="271.5" ></text>
+</g>
+<g >
+<title>large_ralloc (11 samples, 0.55%; 0.00%)</title><rect x="726.6" y="229" width="6.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="729.62" y="239.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (2 samples, 0.10%; 0.00%)</title><rect x="1167.0" y="197" width="1.2" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1169.98" y="207.5" ></text>
+</g>
+<g >
+<title>libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::parseInstructions(libunwind::LocalAddressSpace&amp;, unsigned long, unsigned long, libunwind::CFI_Parser&lt;libunwind::LocalAddressSpace&gt;::CIE_Info const&amp;, unsigned long, libunwind::PrologInfoStackEntry*&amp;, int, libunwind::PrologInfo*, libunwind::StackGuard&amp;) (1 samples, 0.05%; 0.00%)</title><rect x="62.5" y="309" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="65.54" y="319.5" ></text>
+</g>
+<g >
+<title>bool LZ4::(anonymous namespace)::decompressImpl&lt;16ul, false&gt;(char const*, char*, unsigned long, unsigned long) (.llvm.5035804696300559578) (2 samples, 0.10%; +0.05%)</title><rect x="1180.6" y="181" width="1.1" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1183.56" y="191.5" ></text>
+</g>
+<g >
+<title>pread64 (1 samples, 0.05%; 0.00%)</title><rect x="1175.8" y="197" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1178.83" y="207.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;signed char&gt;::deserializeAndInsertFromArena(char const*) (218 samples, 10.91%; -0.80%)</title><rect x="747.9" y="325" width="128.7" height="15.0" fill="rgb(160,160,255)" rx="2" ry="2" />
+<text  x="750.87" y="335.5" >DB::ColumnVector..</text>
+</g>
+<g >
+<title>unw_step (1 samples, 0.05%; 0.00%)</title><rect x="422.0" y="309" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="425.03" y="319.5" ></text>
+</g>
+<g >
+<title>DB::ColumnVector&lt;signed char&gt;::deserializeAndInsertFromArena(char const*) (1 samples, 0.05%; +0.05%)</title><rect x="46.0" y="565" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="49.01" y="575.5" ></text>
+</g>
+<g >
+<title>DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;::insert(StringRef const&amp;) (445 samples, 22.26%; -1.55%)</title><rect x="481.6" y="293" width="262.7" height="15.0" fill="rgb(114,114,255)" rx="2" ry="2" />
+<text  x="484.65" y="303.5" >DB::ReverseIndex&lt;unsigned long, DB:..</text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Index::checkSizeOfType() (1 samples, 0.05%; +0.05%)</title><rect x="1148.7" y="229" width="0.6" height="15.0" fill="rgb(255,206,206)" rx="2" ry="2" />
+<text  x="1151.68" y="239.5" ></text>
+</g>
+<g >
+<title>COW&lt;DB::IColumn&gt;::mutable_ptr&lt;DB::IColumn&gt; DB::ColumnUnique&lt;DB::ColumnString&gt;::uniqueInsertRangeImpl&lt;char8_t&gt;(DB::IColumn const&amp;, unsigned long, unsigned long, unsigned long, DB::ColumnVector&lt;char8_t&gt;::MutablePtr&amp;&amp;, DB::ReverseIndex&lt;unsigned long, DB::ColumnString&gt;*, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="1136.3" y="229" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1139.28" y="239.5" ></text>
+</g>
+<g >
+<title>DB::CompressedReadBufferFromFile::nextImpl() (4 samples, 0.20%; 0.00%)</title><rect x="1180.0" y="245" width="2.3" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1182.96" y="255.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;false, false&gt;::free(void*, unsigned long) (1 samples, 0.05%; 0.00%)</title><rect x="423.8" y="405" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="426.80" y="415.5" ></text>
+</g>
+<g >
+<title>large_ralloc (6 samples, 0.30%; 0.00%)</title><rect x="744.3" y="229" width="3.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="239.5" ></text>
+</g>
+<g >
+<title>__libc_realloc (11 samples, 0.55%; 0.00%)</title><rect x="726.6" y="261" width="6.5" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="729.62" y="271.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::Index::getMaxPositionForCurrentType() const (3 samples, 0.15%; +0.15%)</title><rect x="31.3" y="565" width="1.7" height="15.0" fill="rgb(255,200,200)" rx="2" ry="2" />
+<text  x="34.25" y="575.5" ></text>
+</g>
+<g >
+<title>large_ralloc_no_move (1 samples, 0.05%; 0.00%)</title><rect x="744.3" y="213" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="747.33" y="223.5" ></text>
+</g>
+<g >
+<title>DB::ColumnLowCardinality::insertRangeFromDictionaryEncodedColumn(DB::IColumn const&amp;, DB::IColumn const&amp;) (35 samples, 1.75%; 0.00%)</title><rect x="1148.7" y="261" width="20.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1151.68" y="271.5" ></text>
+</g>
+<g >
+<title>arena_maybe_decay.llvm.9380087101054605540 (1 samples, 0.05%; 0.00%)</title><rect x="1135.1" y="101" width="0.6" height="15.0" fill="rgb(255,255,255)" rx="2" ry="2" />
+<text  x="1138.10" y="111.5" ></text>
+</g>
+<g >
+<title>Allocator&lt;true, true&gt;::realloc(void*, unsigned long, unsigned long, unsigned long) (10 samples, 0.50%; +0.20%)</title><rect x="736.7" y="277" width="5.9" height="15.0" fill="rgb(255,197,197)" rx="2" ry="2" />
+<text  x="739.65" y="287.5" ></text>
+</g>
+<g >
+<title>DB::IAggregateFunctionHelper&lt;DB::AggregateFunctionCount&gt;::addBatch(unsigned long, char**, unsigned long, DB::IColumn const**, DB::Arena*, long) const (13 samples, 0.65%; +0.35%)</title><rect x="393.1" y="373" width="7.7" height="15.0" fill="rgb(255,188,188)" rx="2" ry="2" />
+<text  x="396.10" y="383.5" ></text>
+</g>
+</g>
+</svg>
