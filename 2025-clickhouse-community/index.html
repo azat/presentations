@@ -1,0 +1,712 @@
+<!doctype html>
+
+<!--
+    TODO:
+    - loader
+    - show query button
+    - filter out cherry picks
+    - prepare all data in static CSV files
+
+    TODO: add the following queries:
+    - who has more merge commits
+    - who has less unique commits
+    - reverter badge
+    - top X doing top X of all job
+    - separate out complex and non-complex PRs
+    - unassigned issues with fixed by MRs
+    - the most demanging reviewer
+
+    NOTE:
+    - since github_events does not contains commits only changes via merge requests can be measured.
+    - I've tried different timeframe but it does not makes charts better
+    - yandex/ClickHouse has been excluded due to some oddity in membership
+
+    SEE ALSO:
+    - https://devstats.cncf.io/
+    - https://ghe.clickhouse.tech/#download-the-dataset
+    - https://github.com/ClickHouse/ClickHouse/issues/15323
+-->
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+        <title>ClickHouse Community 2025</title>
+
+        <link rel="stylesheet" href="dist/reset.css">
+        <link rel="stylesheet" href="dist/reveal.css">
+        <link rel="stylesheet" href="dist/theme/white.css">
+
+        <!-- Theme used for syntax highlighted code -->
+        <!-- List of themes are here: https://github.com/highlightjs/highlight.js/tree/main/src/styles -->
+        <link rel="stylesheet" href="plugin/highlight/monokai.css">
+
+        <link rel="stylesheet" href="static/uPlot.min.css">
+
+        <style>
+            /* Do not capitalize the headers */
+            .reveal h1,
+            .reveal h2,
+            .reveal h3,
+            .reveal h4,
+            .reveal h5,
+            .reveal h6 {
+                text-transform: none;
+            }
+
+            /* Expand the code section */
+            .reveal pre code {
+                max-height: 1000px;
+            }
+            .reveal pre.code-wrapper {
+                width: 77%;
+            }
+
+            .uplot-slide-plot {
+                width: 100%;
+                /* TODO: fix this, since I cannot use 100 view port here */
+                height: 70vh;
+            }
+
+            .plots-holder {
+                display: flex;
+            }
+
+            p.plot-note {
+                margin: 50px;
+                font-style: italic;
+                font-size: 0.5em;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="reveal">
+            <div class="slides">
+                <section>
+                    <div>
+                        <h2><a href="https://azat.sh/presentations/2025-clickhouse-community/">ClickHouse Community 2025</a></h2>
+                    </div>
+                </section>
+
+                <section>
+                    <div class="plots-holder" id="overall-events">
+                        <div class="uplot u-hz uplot-slide-plot" id="overall-events-all"></div>
+                        <div class="uplot u-hz uplot-slide-plot" id="overall-events-percent"></div>
+                    </div>
+                </section>
+
+                <section>
+                    <div class="plots-holder" id="pull-requests">
+                        <div class="uplot u-hz uplot-slide-plot" id="pull-requests-all"></div>
+                        <div class="uplot u-hz uplot-slide-plot" id="pull-requests-percent"></div>
+                    </div>
+                </section>
+
+                <section>
+                    <div class="plots-holder" id="changes-rate">
+                        <div class="uplot u-hz uplot-slide-plot" id="changes-rate-all"></div>
+                        <div class="uplot u-hz uplot-slide-plot" id="changes-rate-percent"></div>
+                    </div>
+                </section>
+
+                <section>
+                    <div class="plots-holder" id="days-to-merge">
+                        <div class="uplot u-hz uplot-slide-plot" id="days-to-merge-moving-avg"></div>
+                    </div>
+                </section>
+
+                <section>
+                    <div class="plots-holder" id="reviewers">
+                        <div class="uplot u-hz uplot-slide-plot" id="reviewers-bar"></div>
+                    </div>
+                </section>
+
+                <!--
+                <section>
+                    <div class="plots-holder" id="git-changes">
+                        <div class="uplot u-hz uplot-slide-plot" id="git-changes-per-day"></div>
+                    </div>
+                    <p class="plot-note">Note: Linux has more meaningful history</p>
+                </section>
+                -->
+
+                <!--
+                <section>
+                    <div class="plots-holder" id="pull-requests-distribution">
+                        <div class="uplot u-hz uplot-slide-plot" id="pull-requests-distribution-overall"></div>
+                    </div>
+                </section>
+                -->
+
+                <section>
+                    <div class="plots-holder" id="retention">
+                        <div class="uplot u-hz uplot-slide-plot" id="retention-1"></div>
+                    </div>
+                </section>
+            </div>
+        </div>
+
+        <script src="dist/reveal.js"></script>
+        <script src="plugin/notes/notes.js"></script>
+        <script src="plugin/markdown/markdown.js"></script>
+        <script src="plugin/highlight/highlight.js"></script>
+        <script>
+            // More info about initialization & config:
+            // - https://revealjs.com/initialization/
+            // - https://revealjs.com/config/
+            Reveal.initialize({
+                hash: true,
+
+                width: '90%',
+                height: '90%',
+
+                // Bounds for smallest/largest possible scale to apply to content.
+                // This will fix hover for plots.
+                minScale: 1,
+                maxScale: 1,
+
+                // Learn about plugins: https://revealjs.com/plugins/
+                plugins: [ RevealHighlight ],
+            });
+        </script>
+
+        <script src="static/uPlot.iife.min.js"></script>
+        <script src="static/quadtree.js"></script>
+        <script src="static/distr.js"></script>
+        <script src="static/grouped-bars.js"></script>
+
+        <script>
+            let plots_by_slides = [];
+
+            let available_colors_map = [
+                {
+                    stroke: 'red',
+                    fill: 'rgba(255,0,0,0.1)',
+                },
+                {
+                    stroke: 'green',
+                    fill: 'rgba(0,255,0,0.1)',
+                },
+                {
+                    stroke: 'blue',
+                    fill: 'rgba(0,0,255,0.1)',
+                },
+            ];
+
+            // NOTE: copied from https://leeoniya.github.io/uPlot/demos/box-whisker.html
+            //
+            // converts the legend into a simple tooltip
+            function legendAsTooltipPlugin({ className, style = { backgroundColor:"rgba(255, 249, 196, 0.92)", color: "black" } } = {}) {
+                let legendEl;
+
+                function init(u, opts) {
+                    legendEl = u.root.querySelector(".u-legend");
+
+                    legendEl.classList.remove("u-inline");
+                    className && legendEl.classList.add(className);
+
+                    uPlot.assign(legendEl.style, {
+                        textAlign: "left",
+                        pointerEvents: "none",
+                        display: "none",
+                        position: "absolute",
+                        left: 0,
+                        top: 0,
+                        zIndex: 100,
+                        boxShadow: "2px 2px 10px rgba(0,0,0,0.5)",
+                        ...style
+                    });
+
+                    // hide series color markers
+                    const idents = legendEl.querySelectorAll(".u-marker");
+
+                    for (let i = 0; i < idents.length; i++)
+                        idents[i].style.display = "none";
+
+                    const overEl = u.over;
+                    overEl.style.overflow = "visible";
+
+                    // move legend into plot bounds
+                    overEl.appendChild(legendEl);
+
+                    // show/hide tooltip on enter/exit
+                    overEl.addEventListener("mouseenter", () => {legendEl.style.display = null;});
+                    overEl.addEventListener("mouseleave", () => {legendEl.style.display = "none";});
+
+                    // let tooltip exit plot
+                    // overEl.style.overflow = "visible";
+                }
+
+                function update(u) {
+                    const { left, top } = u.cursor;
+                    legendEl.style.transform = "translate(" + left + "px, " + top + "px)";
+                }
+
+                return {
+                    hooks: {
+                        init: init,
+                        setCursor: update,
+                    }
+                };
+            }
+
+            function resize_plots(slide_id)
+            {
+                let slide_plots = plots_by_slides[slide_id];
+                slide_plots.forEach(plot => {
+                    let plot_element = plot.over.closest('.uplot-slide-plot')
+                    plot.setSize({
+                        width: plot_element.clientWidth,
+                        height: plot_element.clientHeight,
+                    });
+                });
+            }
+
+            /// From https://leeoniya.github.io/uPlot/demos/data-smoothing.html
+            function moving_avg(data, wind) {
+                let rolled = Array(data.length).fill(null);
+
+                let sum = 0;
+                let count = 0;
+
+                for (let i = 0; i < data.length; i++) {
+                    let y = data[i];
+
+                    if (y == null)
+                            continue;
+
+                    sum += y;
+                    count++;
+
+                    if (i > wind - 1) {
+                        sum -= data[i - wind];
+                        count--;
+                    }
+
+                    rolled[i] = sum / count;
+                }
+
+                return rolled;
+            }
+
+            function add_plot(plot_type, slide_id, id, title, columns)
+            {
+                let series = [];
+                let axes = [];
+                let data = [];
+
+                console.log(columns);
+
+                if (plot_type == 'bars') {
+                    let available_names = new Set()
+                    columns['names'].forEach((names_value, row) => {
+                        names_value.forEach((name, index) => {
+                            available_names.add(name);
+                        });
+                    });
+                    console.log('Available names: ', available_names);
+
+                    series.push({
+                        label: 'time',
+                    });
+                    axes.push({
+                    });
+                    data.push(columns['time']);
+
+                    let per_name_columns = [];
+                    available_names.forEach(available_name => {
+                        let column = [];
+                        columns['time'].forEach((times_value, row) => {
+                            let index = columns['names'][row].indexOf(available_name);
+                            let count = index !== -1 ? columns['counts'][row][index] : null;
+                            column.push(count);
+                        });
+                        per_name_columns.push(column);
+                    });
+
+                    axes.push({
+                        scale: 'count',
+                    });
+                    let i = 0;
+                    available_names.forEach(available_name => {
+                        /// TODO: make them static and more light
+                        let random_color = '#' + Math.floor(Math.random()*16777215).toString(16);
+                        series.push({
+                            label: available_name,
+                            fill: random_color,
+                            scale: 'count',
+                        });
+                    });
+                    per_name_columns.forEach((column, index) => {
+                        data.push(column);
+                    });
+                } else {
+                    let i = 0;
+                    for (let column in columns) {
+                        let color = available_colors_map[i++ % available_colors_map.length];
+
+                        series.push({
+                            label: column,
+                            stroke: color.stroke,
+                            fill: color.fill,
+                        });
+                        axes.push({
+                            stroke: color.stroke,
+                        });
+                        data.push(columns[column]);
+                    }
+                }
+                let rows = data[0].length;
+
+                if (plot_type.indexOf('moving_avg') !== -1) {
+                    for (i = 1; i < data.length; ++i) {
+                        data[i] = moving_avg(data[i], 10);
+                    }
+                }
+
+                let element = document.getElementById(id);
+
+                let plot_opts = {
+                    title: title,
+                    width: element.clientWidth,
+                    height: element.clientHeight,
+                    series: series,
+                    axes: axes,
+                    plugins: [
+                        legendAsTooltipPlugin(),
+                    ],
+                };
+                if (plot_type == 'bars') {
+                    plot_opts['plugins'] = [
+                        seriesBarsPlugin({
+                            ori: 0,
+                            dir: 1,
+                        }),
+                    ];
+                }
+                if (plot_type.indexOf('no_date') !== -1) {
+                    plot_opts['scales'] = {
+                        x: {
+                            time: false,
+                        },
+                    }
+                }
+                console.log(plot_opts);
+                let uplot = new uPlot(plot_opts, data, element);
+
+                console.log(`Added plot '${title}' (${plot_type}) to '#${id}' with ${series.length - 1} columns and ${rows} points`);
+
+                if (!(slide_id in plots_by_slides)) {
+                    plots_by_slides[slide_id] = [];
+
+                    let slide_element = document.getElementById(slide_id);
+                    new ResizeObserver(function() {
+                        resize_plots(slide_id);
+                    }).observe(slide_element);
+                }
+                plots_by_slides[slide_id].push(uplot);
+            }
+
+            function get_clickhouse_url(title)
+            {
+                return `https://play.clickhouse.com/?` + (new URLSearchParams({
+                    user: 'play',
+                    default_format: 'JSONColumns',
+                    add_http_cors_header: 1,
+                    // better to use log_comment, it requires non-readonly=1 user
+                    query_id: 'clickhouse-community-' + title,
+                })).toString();
+            }
+
+            /// NOTE: one may use remote() over host, but it maybe cumbersome
+            /// (and also requires non-readonly user).
+            async function load_plot_async(plot_type, slide_id, id, title, query)
+            {
+                fetch(get_clickhouse_url(title), {
+                    'method': 'POST',
+                    'body': query,
+                }).then(r => {
+                    if (r.ok) {
+                        return r.json();
+                    }
+                    return Promise.reject(r);
+                }).then(r => {
+                    add_plot(plot_type, slide_id, id, title, r);
+                }).catch(r => {
+                    if (r instanceof Error) {
+                        alert(r);
+                    } else {
+                        r.text().then(text => {
+                            alert(`Error while executing ${query}. Error: ${text}`);
+                        });
+                    }
+                });
+            }
+
+            /// #overall-events
+            load_plot_async('lines_moving_avg', 'overall-events', 'overall-events-all', 'All events', `
+                SELECT
+                    toUnixTimestamp(toDateTime(toDate(created_at))) AS time,
+                    count()::UInt32                                 AS Everybody,
+                    countIf(author_association == 'MEMBER')::UInt32 AS "ClickHouse Inc",
+                    countIf(author_association != 'MEMBER')::UInt32 AS Community
+                FROM github_events
+                WHERE 1
+                    AND repo_name = 'ClickHouse/ClickHouse'
+                GROUP BY time
+                ORDER BY time
+            `);
+            load_plot_async('lines_moving_avg', 'overall-events', 'overall-events-percent', 'Community Events Ratio', `
+                WITH
+                    count()                                 AS events,
+                    countIf(author_association != 'MEMBER') AS events_community
+                SELECT
+                    toUnixTimestamp(toDateTime(toDate(created_at))) AS time,
+                    events_community/events                         AS Community
+                FROM github_events
+                WHERE 1
+                    AND repo_name = 'ClickHouse/ClickHouse'
+                GROUP BY time
+                ORDER BY time
+            `);
+
+            /// #pull-requests
+            load_plot_async('lines_moving_avg', 'pull-requests', 'pull-requests-all', 'Pull Requests', `
+                SELECT
+                    toUnixTimestamp(toDateTime(toDate(created_at))) AS time,
+                    count()::UInt32                                 AS Everybody,
+                    countIf(author_association == 'MEMBER')::UInt32 AS "ClickHouse Inc",
+                    countIf(author_association != 'MEMBER')::UInt32 AS Community
+                FROM github_events
+                WHERE 1
+                    AND repo_name = 'ClickHouse/ClickHouse'
+                    AND action = 'closed'
+                    AND merged_by != ''
+                GROUP BY time
+                ORDER BY time
+            `);
+            load_plot_async('lines_moving_avg', 'pull-requests', 'pull-requests-percent', 'Community Pull Requests Ratio', `
+                WITH
+                    count()                                 AS prs,
+                    countIf(author_association != 'MEMBER') AS prs_community
+                SELECT
+                    toUnixTimestamp(toDateTime(toDate(created_at))) AS time,
+                    prs_community/prs                               AS Community
+                FROM github_events
+                WHERE 1
+                    AND repo_name = 'ClickHouse/ClickHouse'
+                    AND action = 'closed'
+                    AND merged_by != ''
+                GROUP BY time
+                ORDER BY time
+            `);
+
+            /// #changes-rate
+            load_plot_async('lines_moving_avg', 'changes-rate', 'changes-rate-all', 'Changes (lines)', `
+                SELECT
+                    toUnixTimestamp(toDateTime(toDate(created_at))) AS time,
+                    /* FIXME: min2 with 10000 is some hack for uPlot AFAIR */
+                    min2(sum(additions) + sum(deletions), 10000)    AS Everybody,
+                    min2(sumIf(additions, author_association == 'MEMBER') + sumIf(deletions, author_association == 'MEMBER'), 10000) AS "ClickHouse Inc",
+                    min2(sumIf(additions, author_association != 'MEMBER') + sumIf(deletions, author_association != 'MEMBER'), 10000) AS Community
+                FROM github_events
+                WHERE 1
+                    AND repo_name = 'ClickHouse/ClickHouse'
+                    AND action = 'closed'
+                    AND merged_by != ''
+                GROUP BY time
+                ORDER BY time
+            `);
+            load_plot_async('lines_moving_avg', 'changes-rate', 'changes-rate-percent', 'Community Changes Ratio', `
+                WITH
+                    min2(sum(additions) + sum(deletions), 10000) AS changes_rate,
+                    min2(
+                      sumIf(additions, author_association != 'MEMBER') +
+                      sumIf(deletions, author_association != 'MEMBER'),
+                    10000) AS changes_rate_community
+                SELECT
+                    toUnixTimestamp(toDateTime(toDate(created_at))) AS time,
+                    changes_rate_community/changes_rate             AS Community
+                FROM github_events
+                WHERE 1
+                    AND repo_name = 'ClickHouse/ClickHouse'
+                    AND action = 'closed'
+                    AND merged_by != ''
+                GROUP BY time
+                ORDER BY time
+            `);
+
+            /// #days-to-merge
+            load_plot_async('lines_moving_avg', 'days-to-merge', 'days-to-merge-moving-avg', 'Days to Merge', `
+                SELECT
+                    toDateTime(toStartOfInterval(opened, INTERVAL 1 WEEK))::INT opened_week,
+                    avg(days_to_merge) Everybody,
+                    avgIf(days_to_merge, is_team_member) "ClickHouse Inc",
+                    avgIf(days_to_merge, not is_team_member) Community
+                FROM
+                (
+                    WITH
+                        min(created_at) AS opened,
+                        max(merged_at) AS merged
+                    SELECT
+                        opened,
+                        any(creator_user_login) AS creator,
+                        min2(round((merged - opened) AS diff_/86400, 2), 60) AS days_to_merge,
+                        max(merged_by) AS merger,
+                        number,
+                        any(author_association) == 'MEMBER' AS is_team_member
+                    FROM github_events
+                    WHERE 1
+                        AND repo_name = 'ClickHouse/ClickHouse'
+                        AND event_type IN ('PullRequestReviewEvent', 'PullRequestEvent')
+                        AND (action = 'opened' OR (action = 'closed' AND merged_by != ''))
+                    GROUP BY number
+                    HAVING 1
+                        AND diff_ > 0
+                        AND merger != ''
+                        AND merger NOT LIKE 'robot-%'
+                        AND NOT hasAny(max(labels), ['pr-documentation', 'pr-backport', 'pr-cherrypick'])
+                    ORDER BY days_to_merge
+                )
+                GROUP BY opened_week
+                ORDER BY opened_week
+            `);
+
+            /// #reviewers
+            load_plot_async('bars', 'reviewers', 'reviewers-bar', 'Top reviewers', `
+                WITH
+                    topKWeighted(5)((reviews, reviewer), reviews) AS review_info
+                SELECT
+                    time,
+                    review_info.1 AS counts,
+                    review_info.2 AS names
+                FROM (
+                    SELECT
+                        toYearWeek(created_at) AS time,
+                        countDistinct(number) AS reviews,
+                        actor_login AS reviewer
+                    FROM github_events
+                    WHERE 1
+                        AND repo_name = 'ClickHouse/ClickHouse'
+                        AND event_type IN ('PullRequestReviewEvent')
+                        AND action = 'created'
+                        /* Prohibit self-review (actually most of the time this is replies to the review comments) */
+                        AND actor_login != creator_user_login
+                        /* Filter out random/small notes */
+                        AND has(assignees, actor_login)
+                        AND created_at > now() - INTERVAL 31 DAY
+                        AND NOT hasAny(labels, ['pr-documentation', 'pr-backport', 'pr-cherrypick', 'pr-build', 'pr-ci', '🍃 green ci 🌿'])
+                    GROUP BY time, actor_login
+                    ORDER BY time
+                )
+                GROUP BY time
+                ORDER BY time
+            `);
+
+            // /// #git-changes
+            // load_plot_async('ch-dev2', 'lines_moving_avg', 'git-changes', 'git-changes-per-day', 'git changes per day (Linux vs ClickHouse, without merge commits)', `
+            //     SELECT
+            //         toUnixTimestamp(toDateTime(date)) AS time,
+            //         intDiv(clickhouse.commits, 30) AS clickhouse,
+            //         intDiv(linux.commits, 30) AS linux
+            //     FROM (
+            //         SELECT
+            //             toStartOfInterval(time, INTERVAL 1 MONTH) AS date,
+            //             count()::UInt32 AS commits
+            //         FROM git_clickhouse.commits
+            //         GROUP BY date
+            //     ) AS clickhouse
+            //     LEFT JOIN (
+            //         SELECT
+            //             toStartOfInterval(time, INTERVAL 1 MONTH) AS date,
+            //             count()::UInt32 AS commits
+            //         FROM git_linux.commits
+            //         GROUP BY date
+            //     ) AS linux
+            //     USING date
+            //     ORDER BY time
+            // `);
+
+            /// #pull-requests-distribution
+            // load_plot_async('lines_no_date', 'pull-requests-distribution', 'pull-requests-distribution-overall', 'Pull requests ClickHouse Inc', `
+            //     SELECT
+            //         /* FIXME: this does not propagate the value to the previous points */
+            //         exp2(log2(prs)::int)::Int AS "Pull Requests",
+            //         count()::UInt32 Everybody,
+            //         countIf(is_team_member)::UInt32 "ClickHouse Inc",
+            //         countIf(NOT is_team_member)::UInt32 Community
+            //     FROM
+            //     (
+            //         SELECT
+            //             creator_user_login,
+            //             count() AS prs,
+            //             author_association == 'MEMBER' AS is_team_member
+            //         FROM github_events
+            //         WHERE 1
+            //             AND repo_name = 'ClickHouse/ClickHouse'
+            //             AND event_type = 'PullRequestEvent'
+            //             AND action = 'closed' AND merged_by != ''
+            //             AND NOT hasAny(labels, ['pr-documentation', 'pr-backport', 'pr-cherrypick'])
+            //         GROUP BY creator_user_login, is_team_member
+            //     )
+            //     GROUP BY 1
+            //     ORDER BY 1
+            // `);
+
+            /// #retention
+            load_plot_async('lines_no_date', 'retention', 'retention-1', 'Retention', `
+                WITH
+                    contrib_author_month AS
+                    (
+                        SELECT
+                            creator_user_login AS author,
+                            dateDiff('month', toDate('2016-01-01'), created_at) AS submit_month
+                        FROM github_events
+                        WHERE (repo_name = 'ClickHouse/ClickHouse') AND (event_type = 'PullRequestEvent') AND (action = 'opened')
+                        GROUP BY 1, 2
+                    ),
+                    contrib_first_pull_request AS
+                    (
+                        SELECT
+                            author,
+                            submit_month,
+                            leadInFrame(submit_month) OVER (PARTITION BY author ORDER BY author ASC, submit_month ASC ROWS BETWEEN 1 PRECEDING AND UNBOUNDED FOLLOWING) AS first
+                        FROM contrib_author_month
+                    ),
+                    retention AS
+                    (
+                        SELECT
+                            *,
+                            if(((first - submit_month) AS diff_) > 0, diff_, NULL) AS diff
+                        FROM contrib_first_pull_request
+                    )
+                SELECT
+                    ifNull(diff, -1) months,
+                    countDistinct(author)::UInt32 as authors
+                FROM retention
+                /* Filter out not complete data */
+                WHERE months != -1
+                GROUP BY 1
+                ORDER BY 1
+            `);
+
+
+            /// Usage example:
+            ///
+            /// /// #id-of-some-brand-new-idea
+            /// load_plot_async('lines_moving_avg' /* bars/lines */, 'id-of-some-brand-new-idea', 'id-of-some-brand-new-idea-plot', 'Title', `
+            ///     SELECT 1, 2
+            /// `);
+        </script>
+
+        <!-- Google tag (gtag.js) -->
+        <script async src="https://www.googletagmanager.com/gtag/js?id=G-B0QQGN4BYM"></script>
+        <script>
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+
+            gtag('config', 'G-B0QQGN4BYM');
+        </script>
+    </body>
+</html>
