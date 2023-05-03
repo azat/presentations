@@ -11,3 +11,11 @@
   - `ln -rs .contrib/reveal.js/plugin 2023/plugin`
 - write your `2023/index.html` using documentation for [reveal.js](https://revealjs.com/)
   - I prefer to use [Markdown in html](https://revealjs.com/markdown/)
+
+### Converting to PDF
+
+All you need is to add `?print-pdf` to the URL, i.e.:
+
+    https://azat.sh/presentations/2022-know-your-clickhouse/?print-pdf
+
+For more details you can see the [official documentation](https://revealjs.com/pdf-export/).
