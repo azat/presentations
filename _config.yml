@@ -1,8 +1,15 @@
 title: azat.sh | presentations
 description: "List of my presentations"
-google_analytics: UA-34236898-1
+google_analytics: G-B0QQGN4BYM
 show_downloads: false
-theme: jekyll-theme-minimal
+# Use the latest version of the theme via jekyll-remote-theme, this is required
+# for GA4 [1] that had been fixed in [2], but there was no release with this
+# patch included.
+#
+#   [1]: https://github.com/jekyll/minima/issues/561
+#   [1]: https://github.com/jekyll/minima/pull/281
+remote_theme: jekyll/minima
 
 gems:
+  - jekyll-remote-theme
   - jekyll-mentions
