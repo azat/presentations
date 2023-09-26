@@ -1,6 +1,7 @@
 ### Index
 
 - [Know Your ClickHouse](2022-know-your-clickhouse)
+- [Fast, Memory Efficient Dictionary in ClickHouse](2023-memory-efficient-dictionary)
 
 ### Add new presentation
 

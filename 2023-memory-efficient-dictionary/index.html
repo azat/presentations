@@ -1,0 +1,801 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+        <title>Fast, Memory Efficient Dictionary in ClickHouse</title>
+
+        <link rel="stylesheet" href="dist/reset.css">
+        <link rel="stylesheet" href="dist/reveal.css">
+        <link rel="stylesheet" href="dist/theme/white.css">
+
+        <!-- Theme used for syntax highlighted code -->
+        <!-- List of themes are here: https://github.com/highlightjs/highlight.js/tree/main/src/styles -->
+        <link rel="stylesheet" href="plugin/highlight/zenburn.css">
+
+        <style>
+            /* Do not capitalize the headers */
+            .reveal h1,
+            .reveal h2,
+            .reveal h3,
+            .reveal h4,
+            .reveal h5,
+            .reveal h6 {
+                text-transform: none;
+            }
+
+            .reveal {
+                font-size: 1.9em;
+            }
+
+            section {
+                text-align: left;
+            }
+
+            /* Expand the code section */
+            .reveal pre code {
+                max-height: 800px;
+            }
+            .reveal pre.code-wrapper {
+                text-align: left;
+                /* TODO: fix the styles */
+                width: 100%;
+            }
+            .reveal pre {
+                /* TODO: fix the styles */
+                width: 100%;
+            }
+
+            .pass {
+                color: #1a7f37;
+            }
+            .fail {
+                color: #d1242f;
+            }
+
+            #logo {
+                content: url(semrush-logo-main.png);
+                position: fixed;
+                top: 3.5em;
+                right: 3.5em;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="reveal">
+            <div class="slides">
+<section data-markdown>
+    <textarea data-template>
+        ## [Fast, Memory Efficient Dictionary in ClickHouse](https://azat.sh/presentations/2023-memory-efficient-dictionary/)
+
+        #### <small>_Azat Khuzhin (ClickHouse-Team)_</small>
+        #### <small>_(a.khuzhin@semrush.com)_</small>
+
+        ---
+        ### Outline
+
+        - Building fast, memory efficient hash table
+        - History
+        - Measure performance (memory and CPU)
+        - Calculate the memory usage right!
+        - Trade-offs
+        - Production example
+
+        ---
+        ### Problem
+
+        pagerank
+
+        - tens of trillions of links
+        - hundred of billions of URLs with rank
+
+        _For simplicity, in examples, I will assume that we have ranks only for 1 billion of URLs_
+
+        The obvious solution is to use `HASHED` dictionary.
+
+        ---
+        ### Dictionaries
+
+        Dictionaries are builtin key-value storages in ClickHouse
+
+        Use cases:
+        - enrich your data (and more)
+        - sharding
+        - ...
+
+        ---
+        ### `HASHED`
+
+        - Uses internal hash table implementation (`HashMap`)
+        - Which is very performant (used everywhere)
+
+        ```sql [|9]
+        CREATE DICTIONARY ranks_hashed
+        (
+            `Key` UInt64,
+            `Value` UInt16
+        )
+        PRIMARY KEY Key
+        SOURCE(CLICKHOUSE(TABLE 'local_ranks'))
+        LIFETIME(0)
+        LAYOUT(HASHED());
+        ```
+
+        ---
+        ### `HASHED`: Loading
+
+        ```sql [|2]
+        SYSTEM RELOAD DICTIONARY ranks_hashed;
+        0 rows in set. Elapsed: 266.147 sec.
+        ```
+
+        ```sql [|9-11]
+        SELECT
+            formatReadableQuantity(element_count) AS keys,
+            formatReadableSize(bytes_allocated) AS memory,
+            loading_duration,
+            round((element_count / loading_duration) / 1000000., 2) AS speed_mps
+        FROM system.dictionaries
+        WHERE name = 'ranks_hashed'
+
+        ┌─keys─────────┬─memory────┬─loading_duration─┬─speed_mps─┐
+        │ 1.00 billion │ 32.00 GiB │          231.337 │      4.32 │
+        └──────────────┴───────────┴──────────────────┴───────────┘
+        ```
+
+        *32GiB is it a lot or not? Let's figure this out*
+
+        ---
+        ### `HASHED`: Lookup
+
+        ```sql [|4|11]
+        SELECT count()
+        FROM local_ranks
+        WHERE dictGet(ranks_hashed, 'Value', Key) != Value
+        SETTINGS max_threads = 1
+
+        ┌─count()─┐
+        │       0 │
+        └─────────┘
+
+        1 row in set. Elapsed: 88.135 sec. Processed 1.00 billion rows,
+          10.00 GB (11.35 million rows/s., 113.46 MB/s.)
+        ```
+
+        ---
+        ### `HASHED`: Summary
+
+        - **Memory usage**: **32GiB**
+        - **Lookup** (1 thread): **11.35 million rows/s** (113.46MB/s)
+        - **Load speed**: **4.32 million rows/s**
+
+        ---
+        So let's:
+
+        - revise this numbers
+        - estimate how much RAM it should use
+
+        ---
+        Structure:
+        - 1 billion of keys
+        - 8 byte key
+        - 2 byte value
+
+        Optimal:
+        - 9.31GiB for array
+        - **11.64GiB** with load factor 0.75
+
+        Real:
+        - **32GiB (2.7x more!)**
+
+        For production data:
+        - **~4.2TiB to 15TiB**
+        - **Double for reload!**
+
+        ---
+        ### What's next?
+
+        - The problem is that HASHED dictionary is not optimal in terms of memory <!-- .element class="fragment" -->
+        - So if you need such, you need different layout, <!-- .element class="fragment" -->
+        - But there is no layouts that better then HASHED for our case... <!-- .element class="fragment" -->
+
+        ---
+        ### Alternatives
+
+        - Use separate key-value system <!-- .element class="fail fragment" -->
+        - Write your own key-value <!-- .element class="fail fragment" -->
+        - Improve ClickHouse <!-- .element class="pass fragment" -->
+
+        ---
+        ### Under the hood of `HashMap`
+
+        *Remember, this is ClickHouse builtin implementation*
+
+        <div class="fragment">
+
+        - Open addressing
+
+        </div>
+
+        <div class="fragment">
+
+        - Linear probing
+
+        </div>
+
+        <div class="fragment">
+
+        - Maximum load factor is **0.5**
+
+          ```sql
+          SELECT round(load_factor, 4) FROM system.dictionaries WHERE name = 'ranks_hashed'
+
+          ┌─round(load_factor, 4)─┐
+          │                0.4657 │
+          └───────────────────────┘
+          ```
+
+          So this leads us to **20.37GiB** of RAM (**2.19x**)
+
+        </div>
+
+        <div class="fragment">
+
+        - Quadratic size growing - **24GiB** (**2.58x**) _(Requried for fast lookups)_
+
+        <div class="fragment">
+
+        _And one more thing..._
+
+        </div>
+
+        </div>
+
+        <div class="fragment">
+
+        - C++ structure alignment - **32GiB** (**3.44x**)
+
+        </div>
+
+        <div class="fragment">
+
+        *So, seems that we need to choose other hashtable implementation, that luckily will perform better, right?*
+
+        </div>
+
+        ---
+        ### Hash tables comparison
+
+        **You should always do benchmarks!**
+
+        | container                                                                                     | insert     | find      | maxrss       |
+        | -----------------------------                                                                 | ---------- | --------- | ------------ |
+        | [`google::sparse_hash_map`](https://github.com/sparsehash)                                    | 717.639    | 227.964   | **17575MiB** |
+        | [`tsl::sparse_map`](https://github.com/Tessil/sparse-map)                                     | 306.876    | 113.303   | 20071MiB     |
+        | [`sparsepp`](https://github.com/greg7mdp/sparsepp)                                            | 390.99     | 142.251   | 19807MiB     |
+        | [`folly::F14VectorMap`](https://github.com/facebook/folly/blob/master/folly/container/F14.md) | 134.315    | 49.4222   | 32921MiB     |
+        | [`folly::F14FastMap`](https://github.com/facebook/folly/blob/master/folly/container/F14.md)   | 140.811    | 61.6684   | 49304MiB     |
+        | [`robin_hood::unordered_map`](https://github.com/martinus/robin-hood-hashing)                 | 114.843    | 55.5778   | 52227MiB     |
+        | [`phmap::flat_hash_map`](https://github.com/greg7mdp/parallel-hashmap)                        | 96.6087    | 86.0701   | 52227MiB     |
+        | [`folly::F14NodeMap`](https://github.com/facebook/folly/blob/master/folly/container/F14.md)   | 195.283    | 49.7657   | 49288MiB     |
+        | [`google::dense_hash_map`](https://github.com/sparsehash)                                     | 89.6095    | 58.1243   | 49155MiB     |
+
+        <small>*Results for 8 byte key and 8 byte value*</small>
+
+        <small>*https://github.com/azat-archive/hashtable-bench*</small>
+
+        - *`maxrss` had been measured with glibc*
+
+        ---
+        ### `SPARSE_HASHED`
+
+        ```[|16]
+        $ git show  --stat 6fa234c
+        Date:   Sun Sep 22 15:55:36 2019 +0300
+
+            Merge pull request #6894 from azat-archive/hashed-dict-memory-usage-v2
+
+            [RFC] Add sparsehash support for hashed dictionary (to reduce memory usage)
+
+         dbms/src/Dictionaries/CMakeLists.txt                       |   2 ++
+         dbms/src/Dictionaries/HashedDictionary.cpp                 | 122 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-------------------------
+         dbms/src/Dictionaries/HashedDictionary.h                   |  38 +++++++++++++++++++++++++++++++++++++-
+         dbms/src/Functions/CMakeLists.txt                          |   2 +-
+         dbms/tests/config/ints_dictionary.xml                      |  63 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+         dbms/tests/queries/0_stateless/00950_dict_get.reference    |   3 +++
+         dbms/tests/queries/0_stateless/00950_dict_get.sql          |  28 ++++++++++++++++++++++++++++
+         docs/en/query_language/dicts/external_dicts_dict_layout.md |  13 +++++++++++++
+         8 files changed, 244 insertions(+), 27 deletions(-)
+        ```
+
+        <small>*For the first version*</small>
+
+        - *It does not show submodules*
+        - *I doubt that writing external implementation will have less code*
+
+        ---
+        ### `SPARSE_HASHED`
+
+        ```sql [9]
+        CREATE DICTIONARY ranks_sparse_hashed
+        (
+            `Key` UInt64,
+            `Value` UInt16
+        )
+        PRIMARY KEY Key
+        SOURCE(CLICKHOUSE(TABLE 'local_ranks'))
+        LIFETIME(0)
+        LAYOUT(SPARSE_HASHED());
+        ```
+
+        <small>_Available since: [19.15](https://github.com/ClickHouse/ClickHouse/pull/6894)_</small>
+
+        ---
+        ### `SPARSE_HASHED`: Loading
+
+        ```sql [|2]
+        SYSTEM RELOAD DICTIONARY ranks_sparse_hashed;
+        0 rows in set. Elapsed: 924.806 sec.
+        ```
+
+        ```sql [|10-12]
+        SELECT
+            formatReadableQuantity(element_count) AS keys,
+            formatReadableSize(bytes_allocated) AS memory,
+            round(load_factor, 4) AS load_factor,
+            loading_duration,
+            round((element_count / loading_duration) / 1000000., 2) AS speed_mps
+        FROM system.dictionaries
+        WHERE name = 'ranks_sparse_hashed'
+
+        ┌─keys─────────┬─memory────┬─load_factor─┬─loading_duration─┬─speed_mps─┐
+        │ 1.00 billion │ 9.31  GiB │      0.4657 │          924.806 │      1.08 │
+        └──────────────┴───────────┴─────────────┴──────────────────┴───────────┘
+        ```
+
+        But:
+        - **insertion** is **3.5x slower**!
+        - **9.31GiB** looks like a array...
+
+        ---
+        ### `SPARSE_HASHED`: Memory
+
+        ```c
+        /// size() - returns table size, without empty and deleted
+        /// and since this is sparsehash, empty cells should not be significant,
+        /// and since items cannot be removed from the dictionary, deleted is also not important.
+        ///
+        /// FIXME: for google::sparse_hash_set value_type is Key, for sparse_hash_map
+        /// value_type is std::pair<Key, Value>, and now we correctly takes into
+        /// account padding in structures, if any.
+        template <typename C> auto getBufferSizeInBytes(const C & c)
+        requires (IsGoogleSparseHashTable<C>)
+        { return c.size() * sizeof(typename C::value_type); }
+        ```
+
+        So how can we measure the memory usage?
+
+        ---
+        ### `SPARSE_HASHED`: Memory
+
+        ```sh
+        $ clickhouse-local
+        ```
+
+        ```sql
+        CREATE DICTIONARY ranks_sparse_hashed
+        (
+            `Key` UInt64,
+            `Value` UInt16
+        )
+        PRIMARY KEY Key
+        SOURCE(CLICKHOUSE(HOST '127.0.0.1' TABLE 'local_ranks'))
+        LIFETIME(0)
+        LAYOUT(SPARSE_HASHED())
+
+        SYSTEM RELOAD DICTIONARY ranks_sparse_hashed;
+        ```
+
+        ```sh
+        $ pgrep -f clickhouse.*loc | xargs ps -o rss --no-header
+        22.4g
+        ```
+
+        **2x more!**
+
+        ---
+        ### `SPARSE_HASHED`: Lookup
+
+        ```sql [|11]
+        SELECT count()
+        FROM local_ranks
+        WHERE dictGet(ranks_sparse_hashed, 'Value', Key) != Value
+        SETTINGS max_threads = 1
+
+        ┌─count()─┐
+        │       0 │
+        └─────────┘
+
+        1 row in set. Elapsed: 272.786 sec. Processed 1.00 billion rows,
+          10.00 GB (3.67 million rows/s., 36.66 MB/s.)
+        ```
+
+        **3x slower!**
+
+        ---
+        ### `SPARSE_HASHED` vs `HASHED`
+
+        type|memory|lookup million rows/s *|load million rows/s|memory overhead
+        -|-|-|-|-
+        `HASHED`|32GiB|11.35|4.32|3.44
+        `SPARSE_HASHED`|22.4GiB|3.67|1.08|2.36
+
+        ---
+        ### Under the hood of `sparsehash`
+
+        [![](sparsetable@2x.png)](https://tristanpenman.com/blog/posts/2017/10/11/sparsehash-internals/)
+
+        <small>*Original: https://tristanpenman.com/blog/posts/2017/10/11/sparsehash-internals/*</small>
+
+        ---
+        ### Under the hood of `sparsehash`
+
+        - **unused** elements requires only **1 bit**
+        - **2.7 bits overhead per key** (even non existing):
+          - group size: 48
+          - bitmap (6 bytes)
+          - pointer to the data (8 bytes)
+          - number of free elements (2 bytes)
+          - `(64+48+16)/48=2.6666666666667`
+
+        Approximate memory usage:
+
+        ```sh
+        $ sparsehash-bytes.py \
+            --size 1000000000 \
+            --structure-size 10 \
+            --load-factor 0.456
+        9.99 GiB
+        ```
+
+        <small>_[sparsehash-bytes.py](https://gist.github.com/azat/fe1c087d2bc25f1b831281e1ff80ff9b)_</small>
+
+        ---
+        ### `SPARSE_HASHED`: Memory
+
+        <div class="fragment">
+
+        First problem is the alignment/padding:
+
+        ```sh
+        $ sparsehash-bytes.py \
+            --size 1000000000 \
+            --structure-size 16 \
+            --load-factor 0.456
+        15.58 GiB
+        ```
+
+        </div>
+
+        <div class="fragment">
+
+        And another problem is memory allocator overhead!
+
+        - I've tried different allocators and they had different fragmentation, but the most fragmentation has jemalloc, due to slabs and lots of tiny allocations
+        - AFAIR glibc has 18GiB of RAM
+        - And I don't say anything about data locality...
+
+        </div>
+
+        ---
+        ### Under the hood of `jemalloc`
+
+        [![jemalloc](jemalloc-arena.jpg)](https://www.facebook.com/notes/10158791475077200/)
+
+        *Original: https://www.facebook.com/notes/10158791475077200/*
+
+        [**Redis memory defragmentation for jemalloc**](https://github.com/redis/redis/pull/3720)
+
+        ---
+        ### What's next?
+
+        All memory optimized hash tables will not work when size of your structure is just 10 bytes
+
+        So let's get back to `HashMap`.
+
+        ---
+        ### `HashMap`
+
+        Let's take a look at how it works with memory?
+
+        In terms of memory:
+        - Just one block of memory (_for simple types_)
+        - `mmap`/`munmap`
+        - `mremap`
+
+        So, let's start with the simplest problem - structure padding:
+        - 16 byte key-value: 32GiB
+        - 10 byte key-value: 20GiB
+
+        **This will save 40% of RAM!**
+
+        <small>_Sometimes padding indeed can slow down things, but this is unlikely our case_</small>
+
+        ---
+        ### `SPARSE_HASHED` **v2**
+
+        ```[|8]
+        $ git diff b44497fd^..7b5d156cc5e4 --stat -- :^**examples** :^**tests**
+         src/Common/HashTable/HashMap.h                      |  18 ++++++++++--------
+         src/Common/HashTable/PackedHashMap.h                |  46 ++++++++++++++++++++++++++++++++++++++++++++++
+         src/Dictionaries/HashedDictionary.cpp               |  74 +++++++++-----------------------------------------------------------------
+         src/Dictionaries/HashedDictionary.h                 |  44 +++-----------------------------------------
+         src/Dictionaries/HashedDictionaryCollectionTraits.h | 102 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+         src/Dictionaries/HashedDictionaryCollectionType.h   | 134 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+         6 files changed, 304 insertions(+), 114 deletions(-)
+        ```
+
+        *In clang-16 this optimization cannot be used for some types, due to [ABI change](https://github.com/llvm/llvm-project/commit/277123376ce08c98b07c154bf83e4092a5d4d3c6)*
+
+        notes:
+        - The funny thing here is that while I was writing this patch, in parallel I converted ClickHouse builds to clang-16, and this breaks this dictionary for some types, because in clang-16 they changed the ABI
+
+        ---
+        ### `SPARSE_HASHED` **v2**
+
+        <small>_It is called v2 only on slides_</small>
+
+        ```sql [9]
+        CREATE DICTIONARY ranks_sparse_hashed_v2
+        (
+            `Key` UInt64,
+            `Value` UInt16
+        )
+        PRIMARY KEY Key
+        SOURCE(CLICKHOUSE(TABLE 'local_ranks'))
+        LIFETIME(0)
+        LAYOUT(SPARSE_HASHED());
+        ```
+
+        <small>_Available since: [23.5](https://github.com/ClickHouse/ClickHouse/pull/49380)_</small>
+
+        ---
+        ### `SPARSE_HASHED` **v2**: Summary
+
+        type|memory|lookup million rows/s *|load million rows/s|memory overhead
+        -|-|-|-|-
+        `HASHED`|32GiB|11.35|4.32|3.44
+        `SPARSE_HASHED`|22.4GiB|3.67|1.08|2.36
+        `SPARSE_HASHED` v2|20GiB|10.09|4.08|2.14
+
+        - **~40% less memory**
+        - better then `SPARSE_HASHED v1` in terms of memory and speed (3x)
+        - But there may be some problems with this due to quadratic size growing
+
+        ---
+        ### What's next?
+
+        Remember that that `HashMap` has 0.5 max load factor:
+        - 0.5 max load factor: 20GiB
+        - 1   max load factor: 10GiB
+
+        So let's see how it will work for lookups and loads!
+
+        <small>*In some cases hash tables can degrade the performance with high load factors (>0.7) significantly due to [primary clustering](https://en.wikipedia.org/wiki/Primary_clustering)*</small>
+
+        <small>*Though, there is a [paper that shows the opposite](https://arxiv.org/pdf/2107.01250.pdf), however it requires "graveyard hashing"*</small>
+
+        ---
+        ### `MAX_LOAD_FACTOR`
+
+        ```[|13]
+        $ git show --stat 2996b3860612b6990867c197d630fc50528ec5b8 -- :^tests :^docs
+        Date:   Mon May 1 20:34:47 2023 +0200
+
+            Add ability to configure maximum load factor for the HASHED/SPARSE_HASHED layout
+
+            ...
+
+         src/Dictionaries/HashedDictionary.cpp             |  30 +++++++++++++++++++++++++++---
+         src/Dictionaries/HashedDictionary.h               |   1 +
+         src/Dictionaries/HashedDictionaryCollectionType.h | 102 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++--------
+         3 files changed, 122 insertions(+), 11 deletions(-)
+        ```
+
+        ---
+        ### `MAX_LOAD_FACTOR`
+
+        <small>_There is still quadratic grower (to make it possible to use shifts instead of mod/div), hence we need to use as big load factor as possible_</small>
+
+        ```sql [9]
+        CREATE DICTIONARY ranks_sparse_hashed_v2_98
+        (
+            `Key` UInt64,
+            `Value` UInt16
+        )
+        PRIMARY KEY Key
+        SOURCE(CLICKHOUSE(TABLE 'local_ranks'))
+        LIFETIME(0)
+        LAYOUT(SPARSE_HASHED(MAX_LOAD_FACTOR 0.98))
+        ```
+
+        <small>_Available since: [23.5](https://github.com/ClickHouse/ClickHouse/pull/49380)_</small>
+
+        ---
+        ### `MAX_LOAD_FACTOR`: Summary
+
+        type|memory|lookup million rows/s *|load million rows/s|memory overhead
+        -|-|-|-|-
+        `HASHED`|32GiB|11.35|4.32|3.44
+        `SPARSE_HASHED`|22.4GiB|3.67|1.08|2.36
+        `SPARSE_HASHED` v2|20GiB|10.09|4.08|2.14
+        `SPARSE_HASHED` v2 + `MAX_LOAD_FACTOR 0.98`|10GiB (*0.9313*)|6.27|2.22|1.07
+
+        ---
+        ### What's next?
+
+        The loading is still very slow...
+
+        ---
+        ### Loading...
+
+        Let's do parallel load, but how?:
+        - One way to use locks, but:
+          - it is not cache friendly
+          - not to mention cache contention
+        - Use separate hash table per thread
+
+        ---
+        ### `SHARDS`
+
+        ```[|11]
+        $ git show --stat 8225d28  -- :^tests :^docs
+        commit 8225d2814c8dd6e8711c4f8cff31452a1c112e1c
+        Date:   Wed Jan 18 13:37:10 2023 +0300
+
+            Merge pull request #40003 from azat/dict-shards
+
+            Add ability to load hashed dictionaries using multiple threads
+
+         src/Dictionaries/HashedDictionary.cpp | 610 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-----------------------------------------------------------
+         src/Dictionaries/HashedDictionary.h   | 108 +++++++++++++++++++++++++++++---------------
+         2 files changed, 538 insertions(+), 180 deletions(-)
+        ```
+
+        ---
+        ### `SHARDS`
+
+        ```sql [11]
+        CREATE DICTIONARY ranks_sparse_hashed_v2_98_shards16
+        (
+            `Key` UInt64,
+            `Value` UInt16
+        )
+        PRIMARY KEY Key
+        SOURCE(CLICKHOUSE(TABLE 'local_ranks'))
+        LIFETIME(0)
+        LAYOUT(SPARSE_HASHED(
+            MAX_LOAD_FACTOR 0.98
+            SHARDS 16
+        ))
+        ```
+
+        <small>_Available since: [23.1](https://github.com/ClickHouse/ClickHouse/pull/40003)_</small>
+
+        ---
+        ### `SHARDS`: Summary
+
+        type|memory|lookup million rows/s *|load million rows/s|memory overhead
+        -|-|-|-|-
+        `HASHED`|32GiB|11.35|4.32|3.44
+        `SPARSE_HASHED`|22.4GiB|3.67|1.08|2.36
+        `SPARSE_HASHED` v2|20GiB|10.09|4.08|2.14
+        `SPARSE_HASHED` v2 + `MAX_LOAD_FACTOR 0.98`|10GiB (*0.9313*)|6.27|2.22|1.07
+        **`SPARSE_HASHED` v2 + `MAX_LOAD_FACTOR` + `SHARDS 16`**|**10GiB (*0.9313*)**|**6.59**|**36.27**|**1.07**
+
+        **Load speed is 16x faster!**
+
+        ---
+        ### Overall summary
+
+        - **3x less memory**
+        - **8x faster load**
+        - **2x slower lookups**
+
+        And just **~2K** lines of code:
+
+        ```[|9]
+        $ git show 6fa234c 2a9ff30  8225d28 --shortstat | \
+          grep 'files changed' | \
+          tee /dev/stderr | \
+          awk '{c+=$1; i+=$4; d+=$(NF-1)} END {print "###"; printf("%s files changed, %s insertions(+), %s deletions(-)\n", c, i, d)}'
+         8 files changed, 244 insertions(+), 27 deletions(-)
+         20 files changed, 862 insertions(+), 156 deletions(-)
+         8 files changed, 762 insertions(+), 189 deletions(-)
+        ###
+        36 files changed, 1868 insertions(+), 372 deletions(-)
+        ```
+
+        *Note, `SPARSE_HASHED` based on `sparsehash` is still there when it is benefitial (i.e. for Array)*
+
+        ---
+        ### Real example
+
+        - 12 trillion of elements
+        - 8 byte key
+        - 2 byte value
+
+        Before:
+        - **512GiB**
+
+        After:
+        - **163GiB**
+
+        ---
+        ### Conclusion
+
+        - You should always ask yourself is it works good enough?
+        - You should always benchmark code!
+        - You should always optimize code!
+
+        ---
+        Thank you.
+    </textarea>
+</section>
+            </div>
+        </div>
+
+        <div id="logo"></div>
+
+        <script src="dist/reveal.js"></script>
+        <script src="plugin/notes/notes.js"></script>
+        <script src="plugin/markdown/markdown.js"></script>
+        <script src="plugin/highlight/highlight.js"></script>
+        <script>
+            // More info about initialization & config:
+            // - https://revealjs.com/initialization/
+            // - https://revealjs.com/config/
+            Reveal.initialize({
+                hash: true,
+
+                width: '90%',
+                height: '90%',
+                // center: false,
+
+                // Learn about plugins: https://revealjs.com/plugins/
+                plugins: [ RevealMarkdown, RevealHighlight, RevealNotes ],
+            });
+
+            // https://revealjs.com/pdf-export/
+            Reveal.configure({
+                pdfSeparateFragments: false,
+                // FIXME: This simply hides part of the slides
+                // pdfMaxPagesPerSlide: 1,
+            });
+
+            function logoSwitcher(event)
+            {
+                if (event.indexh > 0) {
+                    document.getElementById('logo').style.content = 'url(semrush-logo-tiny.png)';
+                } else {
+                    document.getElementById('logo').style.content = 'url(semrush-logo-main.png)';
+                }
+            }
+
+            // NOTE: logo is not showed in the PDF, BUT it makes PDF looks better, so I will keep it.
+            Reveal.on('slidechanged', logoSwitcher);
+            Reveal.on('ready', logoSwitcher);
+        </script>
+
+        <!-- Google tag (gtag.js) -->
+        <script async src="https://www.googletagmanager.com/gtag/js?id=G-ZDXJVFF37P"></script>
+        <script>
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+
+            gtag('config', 'G-ZDXJVFF37P');
+        </script>
+    </body>
+</html>
